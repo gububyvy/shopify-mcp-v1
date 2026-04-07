@@ -929,6 +929,49 @@ async def shopify_create_webhook(params: CreateWebhookInput) -> str:
     except Exception as e:
         return _error(e)
 
+class CreateDiscountCodeInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    code: str = Field(..., description="The discount code, e.g. WELCOME10")
+    discount_type: str = Field(..., description="percentage or fixed_amount")
+    value: float = Field(..., description="Discount value (e.g. 10 for 10%)")
+    usage_limit: Optional[int] = Field(default=1, description="Max total uses (None = unlimited)")
+    once_per_customer: bool = Field(default=True, description="Limit to one use per customer")
+    starts_at: Optional[str] = Field(default=None, description="ISO 8601 start date, e.g. 2025-01-01T00:00:00Z")
+    ends_at: Optional[str] = Field(default=None, description="ISO 8601 expiry date")
+
+@mcp.tool(
+    name="shopify_create_discount_code",
+    annotations={"readOnlyHint": False, "destructiveHint": False,
+                 "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_create_discount_code(params: CreateDiscountCodeInput) -> str:
+    """Create a discount code with a price rule. Handles both percentage and fixed amount discounts."""
+    try:
+        price_rule_body = {
+            "price_rule": {
+                "title": params.code,
+                "target_type": "line_item",
+                "target_selection": "all",
+                "allocation_method": "across",
+                "value_type": params.discount_type,
+                "value": f"-{abs(params.value)}",
+                "customer_selection": "all",
+                "usage_limit": params.usage_limit,
+                "once_per_customer": params.once_per_customer,
+                "starts_at": params.starts_at or "2020-01-01T00:00:00Z",
+                **({"ends_at": params.ends_at} if params.ends_at else {}),
+            }
+        }
+        rule = await _request("POST", "price_rules.json", body=price_rule_body)
+        rule_id = rule["price_rule"]["id"]
+
+        code_body = {"discount_code": {"code": params.code}}
+        code = await _request("POST", f"price_rules/{rule_id}/discount_codes.json", body=code_body)
+        return _fmt({"price_rule": rule["price_rule"], "discount_code": code["discount_code"]})
+    except Exception as e:
+        return _error(e)
+
+
 
 # ---------------------------------------------------------------------------
 # Entrypoint
