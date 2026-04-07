@@ -39,7 +39,7 @@ logger = logging.getLogger("shopify_mcp")
 PORT          = int(os.environ.get("PORT", "8000"))
 MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "streamable-http")
 
-mcp = FastMCP("shopify_mcp", host="0.0.0.0", port=PORT, json_response=True)
+mcp = FastMCP(f"shopify_mcp_{SHOPIFY_STORE}", host="0.0.0.0", port=PORT, json_response=True)
 
 
 # ---------------------------------------------------------------------------
