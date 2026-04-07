@@ -343,7 +343,9 @@ class UpdateProductInput(BaseModel):
     tags:         Optional[str]  = Field(default=None)
     status:       Optional[str]  = Field(default=None, description="active, archived, or draft")
     variants:     Optional[List[Dict[str, Any]]] = Field(default=None)
-
+    handle:       Optional[str]  = Field(default=None, description="URL handle / slug for the product")
+    metafields_global_title_tag:       Optional[str] = Field(default=None, description="SEO title tag")
+    metafields_global_description_tag: Optional[str] = Field(default=None, description="SEO meta description")
 
 @mcp.tool(
     name="shopify_update_product",
@@ -353,7 +355,7 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
     """Update an existing product. Only provided fields are changed."""
     try:
         product: Dict[str, Any] = {}
-        for field in ["title", "body_html", "vendor", "product_type", "tags", "status", "variants"]:
+        for field in ["title", "body_html", "vendor", "product_type", "tags", "status", "variants", "handle", "metafields_global_title_tag", "metafields_global_description_tag"]:
             val = getattr(params, field)
             if val is not None:
                 product[field] = val
