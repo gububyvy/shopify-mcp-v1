@@ -974,6 +974,134 @@ async def shopify_create_discount_code(params: CreateDiscountCodeInput) -> str:
         return _error(e)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# THEMES
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ListThemesInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    fields: Optional[str] = Field(default=None, description="Comma-separated fields to include, e.g. id,name,role")
+
+
+@mcp.tool(
+    name="shopify_list_themes",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_themes(params: ListThemesInput) -> str:
+    """List all themes in the store. The theme with role 'main' is the published theme."""
+    try:
+        p: Dict[str, Any] = {}
+        if params.fields:
+            p["fields"] = params.fields
+        data = await _request("GET", "themes.json", params=p)
+        themes = data.get("themes", [])
+        return _fmt({"count": len(themes), "themes": themes})
+    except Exception as e:
+        return _error(e)
+
+
+class GetThemeInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    theme_id: int = Field(..., description="The theme ID")
+
+
+@mcp.tool(
+    name="shopify_get_theme",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_get_theme(params: GetThemeInput) -> str:
+    """Get a single theme by ID."""
+    try:
+        data = await _request("GET", f"themes/{params.theme_id}.json")
+        return _fmt(data.get("theme", data))
+    except Exception as e:
+        return _error(e)
+
+
+class ListThemeAssetsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    theme_id: int = Field(..., description="The theme ID")
+
+
+@mcp.tool(
+    name="shopify_list_theme_assets",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_theme_assets(params: ListThemeAssetsInput) -> str:
+    """List all asset keys (file paths) in a theme. Returns keys like templates/index.json, sections/header.liquid, etc."""
+    try:
+        data = await _request("GET", f"themes/{params.theme_id}/assets.json")
+        assets = data.get("assets", [])
+        return _fmt({"count": len(assets), "assets": assets})
+    except Exception as e:
+        return _error(e)
+
+
+class GetThemeAssetInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    theme_id: int = Field(..., description="The theme ID")
+    asset_key: str = Field(..., description="Asset key path, e.g. templates/index.json, sections/header.liquid, config/settings_data.json")
+
+
+@mcp.tool(
+    name="shopify_get_theme_asset",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_get_theme_asset(params: GetThemeAssetInput) -> str:
+    """Read a single theme file by its asset key. Returns the file content."""
+    try:
+        data = await _request("GET", f"themes/{params.theme_id}/assets.json", params={"asset[key]": params.asset_key})
+        return _fmt(data.get("asset", data))
+    except Exception as e:
+        return _error(e)
+
+
+class UpdateThemeAssetInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    theme_id: int = Field(..., description="The theme ID")
+    asset_key: str = Field(..., description="Asset key path, e.g. templates/product.liquid, sections/header.liquid")
+    value: Optional[str] = Field(default=None, description="The asset content (Liquid, JSON, CSS, JS, etc.)")
+    src: Optional[str] = Field(default=None, description="URL source for the asset (for images/binary files)")
+
+
+@mcp.tool(
+    name="shopify_update_theme_asset",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_update_theme_asset(params: UpdateThemeAssetInput) -> str:
+    """Create or update a theme asset (file). Use 'value' for text content (Liquid, JSON, CSS, JS) or 'src' for a URL to an image/binary file."""
+    try:
+        asset: Dict[str, Any] = {"key": params.asset_key}
+        if params.value is not None:
+            asset["value"] = params.value
+        elif params.src is not None:
+            asset["src"] = params.src
+        else:
+            return "Error: provide either 'value' (file content) or 'src' (URL)."
+        data = await _request("PUT", f"themes/{params.theme_id}/assets.json", body={"asset": asset})
+        return _fmt(data.get("asset", data))
+    except Exception as e:
+        return _error(e)
+
+
+class DeleteThemeAssetInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    theme_id: int = Field(..., description="The theme ID")
+    asset_key: str = Field(..., description="Asset key path to delete")
+
+
+@mcp.tool(
+    name="shopify_delete_theme_asset",
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_delete_theme_asset(params: DeleteThemeAssetInput) -> str:
+    """Delete a theme asset (file). WARNING: this is destructive and cannot be undone."""
+    try:
+        await _request("DELETE", f"themes/{params.theme_id}/assets.json", params={"asset[key]": params.asset_key})
+        return _fmt({"deleted": params.asset_key})
+    except Exception as e:
+        return _error(e)
+
 
 # ---------------------------------------------------------------------------
 # Entrypoint
