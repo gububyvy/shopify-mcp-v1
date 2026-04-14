@@ -1332,13 +1332,12 @@ async def shopify_update_menu(params: UpdateMenuInput) -> str:
     """
     try:
         mutation = """
-        mutation menuUpdate($id: ID!, $title: String, $items: [MenuItemCreateInput!]) {
+        mutation menuUpdate($id: ID!, $title: String!, $items: [MenuItemUpdateInput!]!) {
           menuUpdate(id: $id, title: $title, items: $items) {
             menu {
               id
               title
               handle
-              itemsCount
               items {
                 id
                 title
@@ -1360,10 +1359,8 @@ async def shopify_update_menu(params: UpdateMenuInput) -> str:
         }
         """
         variables: Dict[str, Any] = {"id": params.id}
-        if params.title is not None:
-            variables["title"] = params.title
-        if params.items is not None:
-            variables["items"] = _build_menu_items(params.items)
+        variables["title"] = params.title if params.title else "Main menu"
+        variables["items"] = _build_menu_items(params.items) if params.items else []
 
         data = await _graphql(mutation, variables=variables)
         result = data.get("menuUpdate", {})
