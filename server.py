@@ -2,7 +2,9 @@
 """
 Shopify MCP Server — Full Admin API access via FastMCP.
 Provides tools for managing products, orders, customers, collections,
-inventory, and fulfillments through the Shopify Admin REST API.
+inventory, fulfillments, navigation menus, pages, blogs/articles,
+policies, markets, redirects, and theme assets through the Shopify
+Admin REST + GraphQL API.
 
 Token Management:
   - Uses client_credentials grant to auto-generate and refresh tokens
@@ -1402,6 +1404,506 @@ async def shopify_delete_menu(params: DeleteMenuInput) -> str:
         if result.get("userErrors"):
             return _fmt({"errors": result["userErrors"]})
         return _fmt({"deleted": result.get("deletedMenuId")})
+    except Exception as e:
+        return _error(e)
+
+
+# ---------------------------------------------------------------------------
+# Pages  (REST — requires read_online_store_pages / write_online_store_pages)
+# ---------------------------------------------------------------------------
+
+class ListPagesInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    limit: int = Field(50, ge=1, le=250, description="Max pages to return (1-250)")
+    since_id: Optional[int] = Field(None, description="Restrict results to after this ID")
+    title: Optional[str] = Field(None, description="Filter by page title")
+    published_status: Optional[str] = Field(None, description="Filter: 'published', 'unpublished', or 'any'")
+
+
+@mcp.tool(
+    name="shopify_list_pages",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_pages(params: ListPagesInput) -> str:
+    """List store pages (About, Contact, FAQ, etc.)."""
+    try:
+        qp: Dict[str, Any] = {"limit": params.limit}
+        if params.since_id:
+            qp["since_id"] = params.since_id
+        if params.title:
+            qp["title"] = params.title
+        if params.published_status:
+            qp["published_status"] = params.published_status
+        data = await _request("GET", "pages.json", params=qp)
+        return _fmt(data)
+    except Exception as e:
+        return _error(e)
+
+
+class GetPageInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    page_id: int = Field(..., description="Page ID")
+
+
+@mcp.tool(
+    name="shopify_get_page",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_get_page(params: GetPageInput) -> str:
+    """Get a single page by ID with full HTML body."""
+    try:
+        data = await _request("GET", f"pages/{params.page_id}.json")
+        return _fmt(data)
+    except Exception as e:
+        return _error(e)
+
+
+class CreatePageInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(..., description="Page title")
+    body_html: Optional[str] = Field(None, description="HTML content of the page")
+    published: bool = Field(True, description="Whether the page is visible (default true)")
+    template_suffix: Optional[str] = Field(None, description="Liquid template suffix (e.g. 'contact')")
+    handle: Optional[str] = Field(None, description="URL handle (auto-generated from title if omitted)")
+
+
+@mcp.tool(
+    name="shopify_create_page",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_create_page(params: CreatePageInput) -> str:
+    """Create a new page (About, Contact, FAQ, etc.)."""
+    try:
+        page: Dict[str, Any] = {"title": params.title, "published": params.published}
+        if params.body_html is not None:
+            page["body_html"] = params.body_html
+        if params.template_suffix:
+            page["template_suffix"] = params.template_suffix
+        if params.handle:
+            page["handle"] = params.handle
+        data = await _request("POST", "pages.json", json={"page": page})
+        return _fmt(data)
+    except Exception as e:
+        return _error(e)
+
+
+class UpdatePageInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    page_id: int = Field(..., description="Page ID to update")
+    title: Optional[str] = Field(None, description="New title")
+    body_html: Optional[str] = Field(None, description="New HTML content")
+    published: Optional[bool] = Field(None, description="Published status")
+    template_suffix: Optional[str] = Field(None, description="Liquid template suffix")
+    handle: Optional[str] = Field(None, description="URL handle")
+
+
+@mcp.tool(
+    name="shopify_update_page",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_update_page(params: UpdatePageInput) -> str:
+    """Update an existing page's title, body, or published status."""
+    try:
+        page: Dict[str, Any] = {}
+        if params.title is not None:
+            page["title"] = params.title
+        if params.body_html is not None:
+            page["body_html"] = params.body_html
+        if params.published is not None:
+            page["published"] = params.published
+        if params.template_suffix is not None:
+            page["template_suffix"] = params.template_suffix
+        if params.handle is not None:
+            page["handle"] = params.handle
+        if not page:
+            return _fmt({"error": "No fields to update"})
+        data = await _request("PUT", f"pages/{params.page_id}.json", json={"page": page})
+        return _fmt(data)
+    except Exception as e:
+        return _error(e)
+
+
+class DeletePageInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    page_id: int = Field(..., description="Page ID to delete")
+
+
+@mcp.tool(
+    name="shopify_delete_page",
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_delete_page(params: DeletePageInput) -> str:
+    """Delete a page. WARNING: this is destructive and cannot be undone."""
+    try:
+        await _request("DELETE", f"pages/{params.page_id}.json")
+        return _fmt({"deleted": True, "page_id": params.page_id})
+    except Exception as e:
+        return _error(e)
+
+
+# ---------------------------------------------------------------------------
+# Blogs & Articles  (REST — requires read_content / write_content)
+# ---------------------------------------------------------------------------
+
+class ListBlogsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    limit: int = Field(50, ge=1, le=250, description="Max blogs to return")
+
+
+@mcp.tool(
+    name="shopify_list_blogs",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_blogs(params: ListBlogsInput) -> str:
+    """List all blogs (e.g. 'News', 'Stories')."""
+    try:
+        data = await _request("GET", "blogs.json", params={"limit": params.limit})
+        return _fmt(data)
+    except Exception as e:
+        return _error(e)
+
+
+class ListArticlesInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    blog_id: int = Field(..., description="Blog ID to list articles from")
+    limit: int = Field(50, ge=1, le=250, description="Max articles to return")
+    published_status: Optional[str] = Field(None, description="Filter: 'published', 'unpublished', or 'any'")
+
+
+@mcp.tool(
+    name="shopify_list_articles",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_articles(params: ListArticlesInput) -> str:
+    """List articles in a blog."""
+    try:
+        qp: Dict[str, Any] = {"limit": params.limit}
+        if params.published_status:
+            qp["published_status"] = params.published_status
+        data = await _request("GET", f"blogs/{params.blog_id}/articles.json", params=qp)
+        return _fmt(data)
+    except Exception as e:
+        return _error(e)
+
+
+class GetArticleInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    blog_id: int = Field(..., description="Blog ID")
+    article_id: int = Field(..., description="Article ID")
+
+
+@mcp.tool(
+    name="shopify_get_article",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_get_article(params: GetArticleInput) -> str:
+    """Get a single blog article with full body."""
+    try:
+        data = await _request("GET", f"blogs/{params.blog_id}/articles/{params.article_id}.json")
+        return _fmt(data)
+    except Exception as e:
+        return _error(e)
+
+
+class CreateArticleInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    blog_id: int = Field(..., description="Blog ID to create the article in")
+    title: str = Field(..., description="Article title")
+    body_html: Optional[str] = Field(None, description="HTML content")
+    author: Optional[str] = Field(None, description="Author name")
+    tags: Optional[str] = Field(None, description="Comma-separated tags")
+    summary_html: Optional[str] = Field(None, description="Short summary/excerpt HTML")
+    published: bool = Field(True, description="Whether the article is visible")
+    handle: Optional[str] = Field(None, description="URL handle")
+
+
+@mcp.tool(
+    name="shopify_create_article",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_create_article(params: CreateArticleInput) -> str:
+    """Create a new blog article."""
+    try:
+        article: Dict[str, Any] = {"title": params.title, "published": params.published}
+        if params.body_html is not None:
+            article["body_html"] = params.body_html
+        if params.author:
+            article["author"] = params.author
+        if params.tags:
+            article["tags"] = params.tags
+        if params.summary_html:
+            article["summary_html"] = params.summary_html
+        if params.handle:
+            article["handle"] = params.handle
+        data = await _request("POST", f"blogs/{params.blog_id}/articles.json", json={"article": article})
+        return _fmt(data)
+    except Exception as e:
+        return _error(e)
+
+
+class UpdateArticleInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    blog_id: int = Field(..., description="Blog ID")
+    article_id: int = Field(..., description="Article ID to update")
+    title: Optional[str] = Field(None, description="New title")
+    body_html: Optional[str] = Field(None, description="New HTML content")
+    author: Optional[str] = Field(None, description="Author name")
+    tags: Optional[str] = Field(None, description="Comma-separated tags")
+    summary_html: Optional[str] = Field(None, description="Short summary/excerpt HTML")
+    published: Optional[bool] = Field(None, description="Published status")
+    handle: Optional[str] = Field(None, description="URL handle")
+
+
+@mcp.tool(
+    name="shopify_update_article",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_update_article(params: UpdateArticleInput) -> str:
+    """Update an existing blog article."""
+    try:
+        article: Dict[str, Any] = {}
+        if params.title is not None:
+            article["title"] = params.title
+        if params.body_html is not None:
+            article["body_html"] = params.body_html
+        if params.author is not None:
+            article["author"] = params.author
+        if params.tags is not None:
+            article["tags"] = params.tags
+        if params.summary_html is not None:
+            article["summary_html"] = params.summary_html
+        if params.published is not None:
+            article["published"] = params.published
+        if params.handle is not None:
+            article["handle"] = params.handle
+        if not article:
+            return _fmt({"error": "No fields to update"})
+        data = await _request("PUT", f"blogs/{params.blog_id}/articles/{params.article_id}.json", json={"article": article})
+        return _fmt(data)
+    except Exception as e:
+        return _error(e)
+
+
+class DeleteArticleInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    blog_id: int = Field(..., description="Blog ID")
+    article_id: int = Field(..., description="Article ID to delete")
+
+
+@mcp.tool(
+    name="shopify_delete_article",
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_delete_article(params: DeleteArticleInput) -> str:
+    """Delete a blog article. WARNING: destructive and cannot be undone."""
+    try:
+        await _request("DELETE", f"blogs/{params.blog_id}/articles/{params.article_id}.json")
+        return _fmt({"deleted": True, "blog_id": params.blog_id, "article_id": params.article_id})
+    except Exception as e:
+        return _error(e)
+
+
+# ---------------------------------------------------------------------------
+# Policies  (REST read + GraphQL update — requires read/write_legal_policies)
+# ---------------------------------------------------------------------------
+
+class ListPoliciesInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+@mcp.tool(
+    name="shopify_list_policies",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_policies(params: ListPoliciesInput) -> str:
+    """List all store legal policies (privacy, refund, terms, shipping, etc.)."""
+    try:
+        data = await _request("GET", "policies.json")
+        return _fmt(data)
+    except Exception as e:
+        return _error(e)
+
+
+class UpdatePolicyInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: str = Field(
+        ...,
+        description=(
+            "Policy type: REFUND_POLICY, PRIVACY_POLICY, TERMS_OF_SERVICE, "
+            "SHIPPING_POLICY, LEGAL_NOTICE, SUBSCRIPTION_POLICY, CONTACT_INFORMATION"
+        ),
+    )
+    body: str = Field(..., description="HTML content of the policy")
+
+
+@mcp.tool(
+    name="shopify_update_policy",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_update_policy(params: UpdatePolicyInput) -> str:
+    """Update a store legal policy (privacy, refund, terms, etc.) via GraphQL."""
+    try:
+        mutation = """
+        mutation shopPolicyUpdate($shopPolicy: ShopPolicyInput!) {
+          shopPolicyUpdate(shopPolicy: $shopPolicy) {
+            shopPolicy {
+              id
+              type
+              body
+              url
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+        """
+        variables = {
+            "shopPolicy": {
+                "type": params.type,
+                "body": params.body,
+            }
+        }
+        data = await _graphql(mutation, variables=variables)
+        result = data.get("shopPolicyUpdate", {})
+        if result.get("userErrors"):
+            return _fmt({"errors": result["userErrors"]})
+        return _fmt(result.get("shopPolicy", result))
+    except Exception as e:
+        return _error(e)
+
+
+# ---------------------------------------------------------------------------
+# Markets  (REST — requires read_markets / write_markets)
+# ---------------------------------------------------------------------------
+
+class ListMarketsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+@mcp.tool(
+    name="shopify_list_markets",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_markets(params: ListMarketsInput) -> str:
+    """List all markets (regions/countries the store sells to)."""
+    try:
+        data = await _request("GET", "markets.json")
+        return _fmt(data)
+    except Exception as e:
+        return _error(e)
+
+
+class GetMarketInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    market_id: int = Field(..., description="Market ID")
+
+
+@mcp.tool(
+    name="shopify_get_market",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_get_market(params: GetMarketInput) -> str:
+    """Get a single market by ID (regions, currencies, domains)."""
+    try:
+        data = await _request("GET", f"markets/{params.market_id}.json")
+        return _fmt(data)
+    except Exception as e:
+        return _error(e)
+
+
+class UpdateMarketInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    market_id: int = Field(..., description="Market ID to update")
+    name: Optional[str] = Field(None, description="Market name")
+    enabled: Optional[bool] = Field(None, description="Enable or disable the market")
+
+
+@mcp.tool(
+    name="shopify_update_market",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_update_market(params: UpdateMarketInput) -> str:
+    """Update a market's name or enabled status."""
+    try:
+        market: Dict[str, Any] = {}
+        if params.name is not None:
+            market["name"] = params.name
+        if params.enabled is not None:
+            market["enabled"] = params.enabled
+        if not market:
+            return _fmt({"error": "No fields to update"})
+        data = await _request("PUT", f"markets/{params.market_id}.json", json={"market": market})
+        return _fmt(data)
+    except Exception as e:
+        return _error(e)
+
+
+# ---------------------------------------------------------------------------
+# Redirects  (REST — requires read_content / write_content)
+# ---------------------------------------------------------------------------
+
+class ListRedirectsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    limit: int = Field(50, ge=1, le=250, description="Max redirects to return")
+    path: Optional[str] = Field(None, description="Filter by source path")
+    target: Optional[str] = Field(None, description="Filter by target path")
+
+
+@mcp.tool(
+    name="shopify_list_redirects",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_redirects(params: ListRedirectsInput) -> str:
+    """List URL redirects (301 redirects for SEO)."""
+    try:
+        qp: Dict[str, Any] = {"limit": params.limit}
+        if params.path:
+            qp["path"] = params.path
+        if params.target:
+            qp["target"] = params.target
+        data = await _request("GET", "redirects.json", params=qp)
+        return _fmt(data)
+    except Exception as e:
+        return _error(e)
+
+
+class CreateRedirectInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    path: str = Field(..., description="Source path (e.g. '/old-page')")
+    target: str = Field(..., description="Target path or full URL (e.g. '/new-page')")
+
+
+@mcp.tool(
+    name="shopify_create_redirect",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_create_redirect(params: CreateRedirectInput) -> str:
+    """Create a URL redirect (301) for SEO."""
+    try:
+        data = await _request("POST", "redirects.json", json={
+            "redirect": {"path": params.path, "target": params.target}
+        })
+        return _fmt(data)
+    except Exception as e:
+        return _error(e)
+
+
+class DeleteRedirectInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    redirect_id: int = Field(..., description="Redirect ID to delete")
+
+
+@mcp.tool(
+    name="shopify_delete_redirect",
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_delete_redirect(params: DeleteRedirectInput) -> str:
+    """Delete a URL redirect. WARNING: destructive."""
+    try:
+        await _request("DELETE", f"redirects/{params.redirect_id}.json")
+        return _fmt({"deleted": True, "redirect_id": params.redirect_id})
     except Exception as e:
         return _error(e)
 
