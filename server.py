@@ -1476,7 +1476,7 @@ async def shopify_create_page(params: CreatePageInput) -> str:
             page["template_suffix"] = params.template_suffix
         if params.handle:
             page["handle"] = params.handle
-        data = await _request("POST", "pages.json", json={"page": page})
+        data = await _request("POST", "pages.json", body={"page": page})
         return _fmt(data)
     except Exception as e:
         return _error(e)
@@ -1512,7 +1512,7 @@ async def shopify_update_page(params: UpdatePageInput) -> str:
             page["handle"] = params.handle
         if not page:
             return _fmt({"error": "No fields to update"})
-        data = await _request("PUT", f"pages/{params.page_id}.json", json={"page": page})
+        data = await _request("PUT", f"pages/{params.page_id}.json", body={"page": page})
         return _fmt(data)
     except Exception as e:
         return _error(e)
@@ -1630,7 +1630,7 @@ async def shopify_create_article(params: CreateArticleInput) -> str:
             article["summary_html"] = params.summary_html
         if params.handle:
             article["handle"] = params.handle
-        data = await _request("POST", f"blogs/{params.blog_id}/articles.json", json={"article": article})
+        data = await _request("POST", f"blogs/{params.blog_id}/articles.json", body={"article": article})
         return _fmt(data)
     except Exception as e:
         return _error(e)
@@ -1673,7 +1673,7 @@ async def shopify_update_article(params: UpdateArticleInput) -> str:
             article["handle"] = params.handle
         if not article:
             return _fmt({"error": "No fields to update"})
-        data = await _request("PUT", f"blogs/{params.blog_id}/articles/{params.article_id}.json", json={"article": article})
+        data = await _request("PUT", f"blogs/{params.blog_id}/articles/{params.article_id}.json", body={"article": article})
         return _fmt(data)
     except Exception as e:
         return _error(e)
@@ -1829,7 +1829,7 @@ async def shopify_update_market(params: UpdateMarketInput) -> str:
             market["enabled"] = params.enabled
         if not market:
             return _fmt({"error": "No fields to update"})
-        data = await _request("PUT", f"markets/{params.market_id}.json", json={"market": market})
+        data = await _request("PUT", f"markets/{params.market_id}.json", body={"market": market})
         return _fmt(data)
     except Exception as e:
         return _error(e)
@@ -1877,7 +1877,7 @@ class CreateRedirectInput(BaseModel):
 async def shopify_create_redirect(params: CreateRedirectInput) -> str:
     """Create a URL redirect (301) for SEO."""
     try:
-        data = await _request("POST", "redirects.json", json={
+        data = await _request("POST", "redirects.json", body={
             "redirect": {"path": params.path, "target": params.target}
         })
         return _fmt(data)
