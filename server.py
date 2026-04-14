@@ -1176,7 +1176,7 @@ async def shopify_list_menus(params: ListMenusInput) -> str:
 
 class GetMenuInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    handle: str = Field(..., description="Menu handle, e.g. 'main-menu' or 'footer'")
+    id: str = Field(..., description="Menu GID (e.g. 'gid://shopify/Menu/270336983233') — get from shopify_list_menus")
 
 
 @mcp.tool(
@@ -1184,15 +1184,14 @@ class GetMenuInput(BaseModel):
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
 )
 async def shopify_get_menu(params: GetMenuInput) -> str:
-    """Get a navigation menu by handle, including all items and nested sub-items."""
+    """Get a navigation menu by ID, including all items and nested sub-items."""
     try:
         query = """
-        query getMenu($handle: String!) {
-          menuByHandle(handle: $handle) {
+        query getMenu($id: ID!) {
+          menu(id: $id) {
             id
             title
             handle
-            itemsCount
             items {
               id
               title
@@ -1212,10 +1211,10 @@ async def shopify_get_menu(params: GetMenuInput) -> str:
           }
         }
         """
-        data = await _graphql(query, variables={"handle": params.handle})
-        menu = data.get("menuByHandle")
+        data = await _graphql(query, variables={"id": params.id})
+        menu = data.get("menu")
         if not menu:
-            return _fmt({"error": f"Menu with handle '{params.handle}' not found"})
+            return _fmt({"error": f"Menu '{params.id}' not found"})
         return _fmt(menu)
     except Exception as e:
         return _error(e)
