@@ -1162,7 +1162,6 @@ async def shopify_list_menus(params: ListMenusInput) -> str:
                 id
                 title
                 handle
-                itemsCount
               }
             }
           }
