@@ -224,6 +224,38 @@ async def _request(
         return resp.json()
 
 
+async def _graphql(
+    query: str,
+    variables: Optional[dict] = None,
+    _retried: bool = False,
+) -> dict:
+    """GraphQL helper — for APIs only available via Shopify GraphQL Admin API (e.g. menus)."""
+    if not SHOPIFY_STORE:
+        raise RuntimeError("Missing SHOPIFY_STORE environment variable.")
+
+    url = f"{_base_url()}/graphql.json"
+    headers = await _headers()
+    payload: Dict[str, Any] = {"query": query}
+    if variables:
+        payload["variables"] = variables
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, headers=headers, json=payload, timeout=30.0)
+
+        if resp.status_code == 401 and not _retried and token_manager._use_client_credentials:
+            logger.warning("GraphQL 401 — refreshing token and retrying...")
+            await token_manager.force_refresh()
+            return await _graphql(query, variables=variables, _retried=True)
+
+        resp.raise_for_status()
+        data = resp.json()
+
+        if "errors" in data:
+            raise RuntimeError(f"GraphQL errors: {json.dumps(data['errors'])}")
+
+        return data.get("data", data)
+
+
 def _error(e: Exception) -> str:
     if isinstance(e, httpx.HTTPStatusError):
         status = e.response.status_code
@@ -1099,6 +1131,277 @@ async def shopify_delete_theme_asset(params: DeleteThemeAssetInput) -> str:
     try:
         await _request("DELETE", f"themes/{params.theme_id}/assets.json", params={"asset[key]": params.asset_key})
         return _fmt({"deleted": params.asset_key})
+    except Exception as e:
+        return _error(e)
+
+
+# ---------------------------------------------------------------------------
+# NAVIGATION / MENUS (GraphQL Admin API)
+# Requires scopes: read_online_store_navigation, write_online_store_navigation
+# ---------------------------------------------------------------------------
+
+class ListMenusInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    limit: int = Field(default=25, ge=1, le=100, description="Max menus to return")
+
+
+@mcp.tool(
+    name="shopify_list_menus",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_menus(params: ListMenusInput) -> str:
+    """List all navigation menus in the online store."""
+    try:
+        query = """
+        query listMenus($first: Int!) {
+          menus(first: $first) {
+            edges {
+              node {
+                id
+                title
+                handle
+                itemsCount
+              }
+            }
+          }
+        }
+        """
+        data = await _graphql(query, variables={"first": params.limit})
+        menus = [edge["node"] for edge in data.get("menus", {}).get("edges", [])]
+        return _fmt({"count": len(menus), "menus": menus})
+    except Exception as e:
+        return _error(e)
+
+
+class GetMenuInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    handle: str = Field(..., description="Menu handle, e.g. 'main-menu' or 'footer'")
+
+
+@mcp.tool(
+    name="shopify_get_menu",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_get_menu(params: GetMenuInput) -> str:
+    """Get a navigation menu by handle, including all items and nested sub-items."""
+    try:
+        query = """
+        query getMenu($handle: String!) {
+          menuByHandle(handle: $handle) {
+            id
+            title
+            handle
+            itemsCount
+            items {
+              id
+              title
+              type
+              url
+              resourceId
+              tags
+              items {
+                id
+                title
+                type
+                url
+                resourceId
+                tags
+              }
+            }
+          }
+        }
+        """
+        data = await _graphql(query, variables={"handle": params.handle})
+        menu = data.get("menuByHandle")
+        if not menu:
+            return _fmt({"error": f"Menu with handle '{params.handle}' not found"})
+        return _fmt(menu)
+    except Exception as e:
+        return _error(e)
+
+
+class MenuItemInput(BaseModel):
+    """A single menu item (can include nested sub-items for dropdowns)."""
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(..., description="Display text for the menu item")
+    type: str = Field(default="HTTP", description="Item type: HTTP, COLLECTION, PRODUCT, PAGE, BLOG, SHOP_POLICY, CATALOG")
+    url: Optional[str] = Field(default=None, description="URL for HTTP type items (e.g. '/collections/dresses')")
+    resource_id: Optional[str] = Field(default=None, description="Shopify GID for resource types (e.g. 'gid://shopify/Collection/12345')")
+    items: Optional[List["MenuItemInput"]] = Field(default=None, description="Nested sub-items for dropdown menus")
+
+
+MenuItemInput.model_rebuild()
+
+
+class CreateMenuInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(..., description="Menu title (e.g. 'Main menu')")
+    handle: str = Field(..., description="Menu handle (e.g. 'main-menu')")
+    items: List[MenuItemInput] = Field(..., description="Menu items to create")
+
+
+def _build_menu_items(items: List[MenuItemInput]) -> List[dict]:
+    """Convert Pydantic menu items to GraphQL MenuItemCreateInput format."""
+    result = []
+    for item in items:
+        entry: Dict[str, Any] = {"title": item.title, "type": item.type}
+        if item.url:
+            entry["url"] = item.url
+        if item.resource_id:
+            entry["resourceId"] = item.resource_id
+        if item.items:
+            entry["items"] = _build_menu_items(item.items)
+        result.append(entry)
+    return result
+
+
+@mcp.tool(
+    name="shopify_create_menu",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_create_menu(params: CreateMenuInput) -> str:
+    """Create a new navigation menu with items. Supports nested items for dropdown menus.
+
+    Item types:
+      - HTTP: custom URL (provide 'url' field, e.g. '/collections/dresses')
+      - COLLECTION: link to a collection (provide 'resource_id' as GID)
+      - PRODUCT: link to a product (provide 'resource_id' as GID)
+      - PAGE: link to a page (provide 'resource_id' as GID)
+      - BLOG: link to a blog (provide 'resource_id' as GID)
+      - CATALOG: link to a catalog
+
+    For dropdown menus, nest items inside a parent item's 'items' array.
+    """
+    try:
+        mutation = """
+        mutation menuCreate($title: String!, $handle: String!, $items: [MenuItemCreateInput!]!) {
+          menuCreate(title: $title, handle: $handle, items: $items) {
+            menu {
+              id
+              title
+              handle
+              itemsCount
+              items {
+                id
+                title
+                type
+                url
+                items {
+                  id
+                  title
+                  type
+                  url
+                }
+              }
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+        """
+        variables = {
+            "title": params.title,
+            "handle": params.handle,
+            "items": _build_menu_items(params.items),
+        }
+        data = await _graphql(mutation, variables=variables)
+        result = data.get("menuCreate", {})
+        if result.get("userErrors"):
+            return _fmt({"errors": result["userErrors"]})
+        return _fmt(result.get("menu", result))
+    except Exception as e:
+        return _error(e)
+
+
+class UpdateMenuInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(..., description="Menu GID (e.g. 'gid://shopify/Menu/12345')")
+    title: Optional[str] = Field(default=None, description="New menu title")
+    items: Optional[List[MenuItemInput]] = Field(default=None, description="Complete list of menu items (replaces existing)")
+
+
+@mcp.tool(
+    name="shopify_update_menu",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_update_menu(params: UpdateMenuInput) -> str:
+    """Update an existing navigation menu. Pass items to replace all menu items.
+    Note: items array replaces ALL existing items — include all items you want to keep.
+    """
+    try:
+        mutation = """
+        mutation menuUpdate($id: ID!, $title: String, $items: [MenuItemCreateInput!]) {
+          menuUpdate(id: $id, title: $title, items: $items) {
+            menu {
+              id
+              title
+              handle
+              itemsCount
+              items {
+                id
+                title
+                type
+                url
+                items {
+                  id
+                  title
+                  type
+                  url
+                }
+              }
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+        """
+        variables: Dict[str, Any] = {"id": params.id}
+        if params.title is not None:
+            variables["title"] = params.title
+        if params.items is not None:
+            variables["items"] = _build_menu_items(params.items)
+
+        data = await _graphql(mutation, variables=variables)
+        result = data.get("menuUpdate", {})
+        if result.get("userErrors"):
+            return _fmt({"errors": result["userErrors"]})
+        return _fmt(result.get("menu", result))
+    except Exception as e:
+        return _error(e)
+
+
+class DeleteMenuInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(..., description="Menu GID to delete (e.g. 'gid://shopify/Menu/12345')")
+
+
+@mcp.tool(
+    name="shopify_delete_menu",
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_delete_menu(params: DeleteMenuInput) -> str:
+    """Delete a navigation menu. WARNING: this is destructive and cannot be undone."""
+    try:
+        mutation = """
+        mutation menuDelete($id: ID!) {
+          menuDelete(id: $id) {
+            deletedMenuId
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+        """
+        data = await _graphql(mutation, variables={"id": params.id})
+        result = data.get("menuDelete", {})
+        if result.get("userErrors"):
+            return _fmt({"errors": result["userErrors"]})
+        return _fmt({"deleted": result.get("deletedMenuId")})
     except Exception as e:
         return _error(e)
 
