@@ -384,6 +384,20 @@ class UpdateProductInput(BaseModel):
     metafields_global_title_tag:       Optional[str] = Field(default=None, description="SEO title tag")
     metafields_global_description_tag: Optional[str] = Field(default=None, description="SEO meta description")
 
+async def _get_online_store_publication_id() -> Optional[str]:
+    """Fetch the Online Store publication GID via GraphQL. Cached implicitly per-request."""
+    query = """
+    query { publications(first: 25) { nodes { id name } } }
+    """
+    data = await _graphql(query)
+    for pub in data.get("publications", {}).get("nodes", []):
+        if "online store" in (pub.get("name") or "").lower():
+            return pub["id"]
+    # Fallback: first publication
+    pubs = data.get("publications", {}).get("nodes", [])
+    return pubs[0]["id"] if pubs else None
+
+
 @mcp.tool(
     name="shopify_update_product",
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -393,14 +407,63 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
 
     To rename a variant option (e.g. 'Color' to 'Colour'), include the options array with the existing option id and new name:
         options=[{"id": 10240203915373, "name": "Colour"}]
+
+    To schedule future publication: pass status='active' + published_at=<future ISO date>.
+    This uses GraphQL publishablePublish internally since REST cannot schedule.
     """
     try:
+        # Detect scheduling intent: future published_at means "schedule" not "publish now"
+        schedule_date = None
+        if params.published_at:
+            try:
+                from datetime import datetime, timezone
+                pub_dt = datetime.fromisoformat(params.published_at.replace("Z", "+00:00"))
+                now = datetime.now(timezone.utc)
+                if pub_dt > now:
+                    schedule_date = params.published_at
+            except Exception:
+                pass  # If we can't parse, fall through to REST behaviour
+
+        # Build REST update payload — exclude published_at when scheduling (REST can't honour future dates)
         product: Dict[str, Any] = {}
-        for field in ["title", "body_html", "vendor", "product_type", "tags", "status", "variants", "options", "images", "handle", "published_at", "metafields_global_title_tag", "metafields_global_description_tag"]:
+        for field in ["title", "body_html", "vendor", "product_type", "tags", "status", "variants", "options", "images", "handle", "metafields_global_title_tag", "metafields_global_description_tag"]:
             val = getattr(params, field)
             if val is not None:
                 product[field] = val
+        if params.published_at is not None and not schedule_date:
+            product["published_at"] = params.published_at
+
+        # When scheduling: keep status as draft via REST so product stays hidden until publishDate
+        if schedule_date:
+            product["status"] = "draft"
+
         data = await _request("PUT", f"products/{params.product_id}.json", body={"product": product})
+
+        # If scheduling, now fire the GraphQL publishablePublish with publishDate
+        if schedule_date:
+            pub_id = await _get_online_store_publication_id()
+            if not pub_id:
+                return _error(Exception("No publication found to schedule product"))
+
+            mutation = """
+            mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {
+              publishablePublish(id: $id, input: $input) {
+                publishable { ... on Product { id title status } }
+                userErrors { field message }
+              }
+            }
+            """
+            product_gid = f"gid://shopify/Product/{params.product_id}"
+            pub_input = {"publicationId": pub_id, "publishDate": schedule_date}
+            gql_data = await _graphql(mutation, variables={"id": product_gid, "input": [pub_input]})
+            gql_result = gql_data.get("publishablePublish", {})
+            if gql_result.get("userErrors"):
+                return _error(Exception(f"Schedule errors: {json.dumps(gql_result['userErrors'])}"))
+            # Return the REST product with a scheduled flag
+            prod = data.get("product", data)
+            prod["_scheduled"] = {"publishDate": schedule_date, "publicationId": pub_id}
+            return _fmt(prod)
+
         return _fmt(data.get("product", data))
     except Exception as e:
         return _error(e)
