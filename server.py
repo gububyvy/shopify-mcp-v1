@@ -440,10 +440,16 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
         try:
             data = await _request("PUT", f"products/{params.product_id}.json", body={"product": product})
         except Exception as rest_err:
-            err_msg = str(rest_err)
+            # Extract error body from HTTPStatusError to detect 100-variant limit
+            err_body_str = str(rest_err)
+            if isinstance(rest_err, httpx.HTTPStatusError):
+                try:
+                    err_body_str = json.dumps(rest_err.response.json())
+                except Exception:
+                    err_body_str = rest_err.response.text
             # Fallback: if REST fails due to 100+ variant limit AND user is only updating variants
             # (plus optional simple product fields), try GraphQL productVariantsBulkUpdate
-            if ("more than 100 variants" in err_msg or "2024-04 or later" in err_msg) and params.variants:
+            if ("more than 100 variants" in err_body_str or "2024-04 or later" in err_body_str) and params.variants:
                 # Map REST variant dicts to GraphQL ProductVariantsBulkInput
                 gql_variants = []
                 for v in params.variants:
