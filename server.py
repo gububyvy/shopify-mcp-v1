@@ -437,7 +437,64 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
         if schedule_date:
             product["status"] = "draft"
 
-        data = await _request("PUT", f"products/{params.product_id}.json", body={"product": product})
+        try:
+            data = await _request("PUT", f"products/{params.product_id}.json", body={"product": product})
+        except Exception as rest_err:
+            err_msg = str(rest_err)
+            # Fallback: if REST fails due to 100+ variant limit AND user is only updating variants
+            # (plus optional simple product fields), try GraphQL productVariantsBulkUpdate
+            if ("more than 100 variants" in err_msg or "2024-04 or later" in err_msg) and params.variants:
+                # Map REST variant dicts to GraphQL ProductVariantsBulkInput
+                gql_variants = []
+                for v in params.variants:
+                    vid = v.get("id")
+                    if vid is None:
+                        continue
+                    entry: Dict[str, Any] = {"id": f"gid://shopify/ProductVariant/{vid}"}
+                    # Translate snake_case to camelCase for GraphQL
+                    if "price" in v:
+                        entry["price"] = str(v["price"])
+                    if "compare_at_price" in v:
+                        # null/None explicitly clears; also accept "0.00" or "" to clear
+                        cap = v["compare_at_price"]
+                        entry["compareAtPrice"] = None if cap in (None, "", "0.00", "0", 0) else str(cap)
+                    if "compareAtPrice" in v:
+                        entry["compareAtPrice"] = v["compareAtPrice"]
+                    if "barcode" in v:
+                        entry["barcode"] = v["barcode"]
+                    if "sku" in v:
+                        entry["sku"] = v["sku"]
+                    if "taxable" in v:
+                        entry["taxable"] = v["taxable"]
+                    if "inventory_policy" in v:
+                        entry["inventoryPolicy"] = v["inventory_policy"].upper() if isinstance(v["inventory_policy"], str) else v["inventory_policy"]
+                    gql_variants.append(entry)
+
+                if not gql_variants:
+                    raise rest_err  # re-raise original if nothing to update
+
+                product_gid = f"gid://shopify/Product/{params.product_id}"
+                mutation = """
+                mutation productVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+                  productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+                    product { id title }
+                    productVariants { id price compareAtPrice }
+                    userErrors { field message }
+                  }
+                }
+                """
+                gql_data = await _graphql(mutation, variables={"productId": product_gid, "variants": gql_variants})
+                gql_result = gql_data.get("productVariantsBulkUpdate", {})
+                if gql_result.get("userErrors"):
+                    return _error(Exception(f"GraphQL bulk update errors: {json.dumps(gql_result['userErrors'])}"))
+                return _fmt({
+                    "product_id": params.product_id,
+                    "_fallback": "productVariantsBulkUpdate (REST 100-variant limit)",
+                    "updated_variants": len(gql_result.get("productVariants", [])),
+                    "product": gql_result.get("product"),
+                })
+            # Re-raise if not a 100-variant issue or nothing to fall back to
+            raise
 
         # If scheduling, now fire the GraphQL publishablePublish with publishDate
         if schedule_date:
