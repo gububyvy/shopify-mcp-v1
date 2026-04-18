@@ -380,6 +380,7 @@ class UpdateProductInput(BaseModel):
     options:      Optional[List[Dict[str, Any]]] = Field(default=None, description="Product options with id and name (e.g. to rename 'Color' to 'Colour'). Include id of existing options to rename, or omit id to replace all.")
     images:       Optional[List[Dict[str, Any]]] = Field(default=None, description="Image objects with src URL")
     handle:       Optional[str]  = Field(default=None, description="URL handle / slug for the product")
+    published_at: Optional[str]  = Field(default=None, description="ISO 8601 publish date (e.g. '2026-04-21T09:00:00Z'). Combined with status='active', schedules future publication. Set to null to unpublish.")
     metafields_global_title_tag:       Optional[str] = Field(default=None, description="SEO title tag")
     metafields_global_description_tag: Optional[str] = Field(default=None, description="SEO meta description")
 
@@ -395,7 +396,7 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
     """
     try:
         product: Dict[str, Any] = {}
-        for field in ["title", "body_html", "vendor", "product_type", "tags", "status", "variants", "options", "images", "handle", "metafields_global_title_tag", "metafields_global_description_tag"]:
+        for field in ["title", "body_html", "vendor", "product_type", "tags", "status", "variants", "options", "images", "handle", "published_at", "metafields_global_title_tag", "metafields_global_description_tag"]:
             val = getattr(params, field)
             if val is not None:
                 product[field] = val
