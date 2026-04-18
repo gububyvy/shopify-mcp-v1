@@ -488,6 +488,116 @@ async def shopify_delete_product(params: DeleteProductInput) -> str:
 
 
 # ---------------------------------------------------------------------------
+# VARIANT BULK OPERATIONS (GraphQL) — works on products with 100+ variants
+# REST variant/product endpoints fail on products with >= 100 variants; these
+# GraphQL-based tools work regardless.
+# ---------------------------------------------------------------------------
+
+
+class BulkUpdateVariantsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    product_id: int = Field(..., description="Product ID (numeric)")
+    variants: List[Dict[str, Any]] = Field(
+        ...,
+        description=(
+            "List of variant updates. Each item must have 'id' (numeric variant id). "
+            "Supported fields: price (str), compareAtPrice (str or null to clear), "
+            "barcode, sku, taxable, inventoryPolicy."
+        ),
+    )
+
+
+@mcp.tool(
+    name="shopify_bulk_update_variants",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_bulk_update_variants(params: BulkUpdateVariantsInput) -> str:
+    """Bulk update variants on a product using GraphQL productVariantsBulkUpdate.
+
+    Example: remove compareAtPrice on all variants:
+      variants=[{"id": 123, "compareAtPrice": null}, {"id": 456, "compareAtPrice": null}, ...]
+
+    Works on products with any number of variants (unlike REST which fails at 100+).
+    """
+    try:
+        product_gid = f"gid://shopify/Product/{params.product_id}"
+        gql_variants = []
+        for v in params.variants:
+            vid = v.get("id")
+            if vid is None:
+                continue
+            entry: Dict[str, Any] = {"id": f"gid://shopify/ProductVariant/{vid}"}
+            for key in ("price", "compareAtPrice", "barcode", "sku", "taxable", "inventoryPolicy"):
+                if key in v:
+                    entry[key] = v[key]
+            gql_variants.append(entry)
+
+        mutation = """
+        mutation productVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+          productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+            product { id title }
+            productVariants { id price compareAtPrice }
+            userErrors { field message }
+          }
+        }
+        """
+        data = await _graphql(mutation, variables={"productId": product_gid, "variants": gql_variants})
+        result = data.get("productVariantsBulkUpdate", {})
+        if result.get("userErrors"):
+            return _error(Exception(f"Bulk update errors: {json.dumps(result['userErrors'])}"))
+        # Only return summary to keep response small
+        variant_count = len(result.get("productVariants", []))
+        return _fmt({
+            "product_id": params.product_id,
+            "updated_variants": variant_count,
+            "product": result.get("product"),
+        })
+    except Exception as e:
+        return _error(e)
+
+
+class BulkDeleteVariantsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    product_id: int = Field(..., description="Product ID (numeric)")
+    variant_ids: List[int] = Field(..., description="List of numeric variant IDs to delete")
+
+
+@mcp.tool(
+    name="shopify_bulk_delete_variants",
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_bulk_delete_variants(params: BulkDeleteVariantsInput) -> str:
+    """Bulk delete variants on a product using GraphQL productVariantsBulkDelete.
+
+    Works on products with any number of variants (unlike REST which fails at 100+).
+    Useful for reducing variant count below 100 to restore REST editability.
+    """
+    try:
+        product_gid = f"gid://shopify/Product/{params.product_id}"
+        variant_gids = [f"gid://shopify/ProductVariant/{vid}" for vid in params.variant_ids]
+
+        mutation = """
+        mutation productVariantsBulkDelete($productId: ID!, $variantsIds: [ID!]!) {
+          productVariantsBulkDelete(productId: $productId, variantsIds: $variantsIds) {
+            product { id title }
+            userErrors { field message }
+          }
+        }
+        """
+        data = await _graphql(mutation, variables={"productId": product_gid, "variantsIds": variant_gids})
+        result = data.get("productVariantsBulkDelete", {})
+        if result.get("userErrors"):
+            return _error(Exception(f"Bulk delete errors: {json.dumps(result['userErrors'])}"))
+        return _fmt({
+            "product_id": params.product_id,
+            "deleted_count": len(variant_gids),
+            "product": result.get("product"),
+        })
+    except Exception as e:
+        return _error(e)
+
+
+# ---------------------------------------------------------------------------
 # PRODUCT PUBLISHING / SCHEDULING (GraphQL Admin API)
 # Use these to schedule a product to auto-publish at a future date.
 # Flow: (1) list_publications to find the Online Store publication id once,
