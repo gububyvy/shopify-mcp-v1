@@ -376,7 +376,9 @@ class UpdateProductInput(BaseModel):
     product_type: Optional[str]  = Field(default=None)
     tags:         Optional[str]  = Field(default=None)
     status:       Optional[str]  = Field(default=None, description="active, archived, or draft")
-    variants:     Optional[List[Dict[str, Any]]] = Field(default=None)
+    variants:     Optional[List[Dict[str, Any]]] = Field(default=None, description="Variant objects with id, price, option1/option2/option3, etc.")
+    options:      Optional[List[Dict[str, Any]]] = Field(default=None, description="Product options with id and name (e.g. to rename 'Color' to 'Colour'). Include id of existing options to rename, or omit id to replace all.")
+    images:       Optional[List[Dict[str, Any]]] = Field(default=None, description="Image objects with src URL")
     handle:       Optional[str]  = Field(default=None, description="URL handle / slug for the product")
     metafields_global_title_tag:       Optional[str] = Field(default=None, description="SEO title tag")
     metafields_global_description_tag: Optional[str] = Field(default=None, description="SEO meta description")
@@ -386,10 +388,14 @@ class UpdateProductInput(BaseModel):
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
 )
 async def shopify_update_product(params: UpdateProductInput) -> str:
-    """Update an existing product. Only provided fields are changed."""
+    """Update an existing product. Only provided fields are changed.
+
+    To rename a variant option (e.g. 'Color' to 'Colour'), include the options array with the existing option id and new name:
+        options=[{"id": 10240203915373, "name": "Colour"}]
+    """
     try:
         product: Dict[str, Any] = {}
-        for field in ["title", "body_html", "vendor", "product_type", "tags", "status", "variants", "handle", "metafields_global_title_tag", "metafields_global_description_tag"]:
+        for field in ["title", "body_html", "vendor", "product_type", "tags", "status", "variants", "options", "images", "handle", "metafields_global_title_tag", "metafields_global_description_tag"]:
             val = getattr(params, field)
             if val is not None:
                 product[field] = val
