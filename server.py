@@ -424,6 +424,97 @@ async def shopify_delete_product(params: DeleteProductInput) -> str:
         return _error(e)
 
 
+# ---------------------------------------------------------------------------
+# PRODUCT PUBLISHING / SCHEDULING (GraphQL Admin API)
+# Use these to schedule a product to auto-publish at a future date.
+# Flow: (1) list_publications to find the Online Store publication id once,
+#       (2) schedule_product with that id + future publishDate.
+# ---------------------------------------------------------------------------
+
+
+class ListPublicationsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    limit: int = Field(default=25, ge=1, le=100, description="Max publications to return")
+
+
+@mcp.tool(
+    name="shopify_list_publications",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_publications(params: ListPublicationsInput) -> str:
+    """List all sales channel publications (Online Store, POS, etc.). Use the id with shopify_schedule_product."""
+    try:
+        query = """
+        query listPublications($first: Int!) {
+          publications(first: $first) {
+            nodes {
+              id
+              name
+            }
+          }
+        }
+        """
+        data = await _graphql(query, variables={"first": params.limit})
+        pubs = data.get("publications", {}).get("nodes", [])
+        return _fmt({"count": len(pubs), "publications": pubs})
+    except Exception as e:
+        return _error(e)
+
+
+class ScheduleProductInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    product_id:     int  = Field(..., description="Numeric product ID (e.g. 8049138073709)")
+    publication_id: str  = Field(..., description="Publication GID from shopify_list_publications (e.g. 'gid://shopify/Publication/12345')")
+    publish_date:   Optional[str] = Field(default=None, description="ISO 8601 datetime to publish (e.g. '2026-04-25T09:00:00Z'). Omit to publish immediately.")
+
+
+@mcp.tool(
+    name="shopify_schedule_product",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_schedule_product(params: ScheduleProductInput) -> str:
+    """Schedule (or immediately publish) a product on a given publication/channel. Uses GraphQL publishablePublish mutation.
+
+    To schedule: provide a future publish_date (ISO 8601). The product will auto-publish at that time.
+    To publish now: omit publish_date.
+    Product status must be 'active' (not 'draft') — set via shopify_update_product first if needed.
+    """
+    try:
+        pub_input: Dict[str, Any] = {"publicationId": params.publication_id}
+        if params.publish_date is not None:
+            pub_input["publishDate"] = params.publish_date
+
+        mutation = """
+        mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {
+          publishablePublish(id: $id, input: $input) {
+            publishable {
+              ... on Product {
+                id
+                title
+                status
+                publishedOnPublication(publicationId: "%s")
+              }
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+        """ % params.publication_id
+
+        product_gid = f"gid://shopify/Product/{params.product_id}"
+        data = await _graphql(mutation, variables={"id": product_gid, "input": [pub_input]})
+        result = data.get("publishablePublish", {})
+
+        if result.get("userErrors"):
+            return _error(Exception(f"Publish errors: {json.dumps(result['userErrors'])}"))
+
+        return _fmt(result.get("publishable", result))
+    except Exception as e:
+        return _error(e)
+
+
 class ProductCountInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     status:       Optional[str] = Field(default=None, description="active, archived, or draft")
