@@ -1101,6 +1101,41 @@ async def shopify_get_collection_products(params: GetCollectionProductsInput) ->
         return _error(e)
 
 
+class UpdateCollectionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    collection_id:   int            = Field(..., description="Collection ID to update")
+    collection_type: Optional[str]  = Field(default="smart", description="'custom' or 'smart'")
+    title:           Optional[str]  = Field(default=None, description="Collection title")
+    body_html:       Optional[str]  = Field(default=None, description="Collection description (HTML)")
+    metafields_global_title_tag:       Optional[str] = Field(default=None, description="SEO page title (overrides the collection title in search results)")
+    metafields_global_description_tag: Optional[str] = Field(default=None, description="SEO meta description (shown in search engine snippets)")
+
+
+@mcp.tool(
+    name="shopify_update_collection",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_update_collection(params: UpdateCollectionInput) -> str:
+    """Update a collection's title, description, or SEO fields (page title + meta description).
+    Works for both custom and smart collections. Only provided fields are changed."""
+    try:
+        endpoint_key = "custom_collection" if params.collection_type == "custom" else "smart_collection"
+        endpoint_url = (
+            f"custom_collections/{params.collection_id}.json"
+            if params.collection_type == "custom"
+            else f"smart_collections/{params.collection_id}.json"
+        )
+        payload: Dict[str, Any] = {}
+        for field in ["title", "body_html", "metafields_global_title_tag", "metafields_global_description_tag"]:
+            val = getattr(params, field)
+            if val is not None:
+                payload[field] = val
+        data = await _request("PUT", endpoint_url, body={endpoint_key: payload})
+        return _fmt(data)
+    except Exception as e:
+        return _error(e)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # INVENTORY
 # ═══════════════════════════════════════════════════════════════════════════
