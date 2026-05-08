@@ -469,6 +469,10 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
         if schedule_date:
             product["status"] = "draft"
 
+        # If only metafields were provided (no product fields), skip REST call
+        if not product and metafields_result is not None:
+            return _fmt({"id": params.product_id, "_metafields": metafields_result})
+
         try:
             data = await _request("PUT", f"products/{params.product_id}.json", body={"product": product})
         except Exception as rest_err:
