@@ -443,10 +443,17 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
 
             # Standard Shopify category metafields (list.metaobject_reference)
             # Need to: 1) get metafield definition 2) find metaobject type 3) lookup GID by name
-            if shopify_mfs:
-                for mf in shopify_mfs:
-                    key = mf["key"]
-                    value_name = mf["value"]
+            # Group by key first (e.g. multiple size values → one metafield with multiple GIDs)
+            from collections import defaultdict
+            grouped_shopify_mfs = defaultdict(list)
+            for mf in shopify_mfs:
+                grouped_shopify_mfs[mf["key"]].append(mf["value"])
+            # Convert back: each key gets all its values
+            shopify_mfs_grouped = [{"key": k, "values": v} for k, v in grouped_shopify_mfs.items()]
+            if shopify_mfs_grouped:
+                for mf_group in shopify_mfs_grouped:
+                    key = mf_group["key"]
+                    value_names = mf_group["values"]
                     try:
                         # Step 1: Get metafield definition to find the validation metaobject type
                         def_query = """
@@ -476,10 +483,8 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
                         mo_type = None
                         for v in mf_def.get("validations", []):
                             if v.get("name") == "metaobject_definition_id":
-                                # Extract type from the metaobject definition
                                 mo_def_gid = v.get("value", "")
                                 if mo_def_gid:
-                                    # Query the metaobject definition to get its type
                                     mo_def_query = """
                                     query getMoDef($id: ID!) {
                                       node(id: $id) {
@@ -498,7 +503,7 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
                             )
                             continue
 
-                        # Step 3: Search metaobjects by name to find GID
+                        # Step 3: Search metaobjects for ALL values, collect GIDs
                         mo_query = """
                         query findMO($type: String!, $q: String) {
                           metaobjects(type: $type, first: 50, query: $q) {
@@ -506,33 +511,36 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
                           }
                         }
                         """
-                        mo_data = await _graphql(mo_query, variables={"type": mo_type, "q": value_name})
-                        mo_nodes = mo_data.get("metaobjects", {}).get("nodes", [])
+                        all_gids = []
+                        missing = []
+                        for value_name in value_names:
+                            mo_data = await _graphql(mo_query, variables={"type": mo_type, "q": value_name})
+                            mo_nodes = mo_data.get("metaobjects", {}).get("nodes", [])
+                            matched_gid = None
+                            for mo in mo_nodes:
+                                if mo.get("displayName", "").lower() == value_name.lower():
+                                    matched_gid = mo.get("id")
+                                    break
+                            if not matched_gid and mo_nodes:
+                                matched_gid = mo_nodes[0].get("id")
+                            if matched_gid:
+                                all_gids.append(matched_gid)
+                            else:
+                                missing.append(value_name)
 
-                        # Find exact match by displayName
-                        matched_gid = None
-                        for mo in mo_nodes:
-                            if mo.get("displayName", "").lower() == value_name.lower():
-                                matched_gid = mo.get("id")
-                                break
-                        # Fallback: first result
-                        if not matched_gid and mo_nodes:
-                            matched_gid = mo_nodes[0].get("id")
-
-                        if matched_gid:
+                        if all_gids:
                             gql_metafields.append({
                                 "ownerId": f"gid://shopify/Product/{params.product_id}",
                                 "namespace": "shopify",
                                 "key": key,
-                                "value": json.dumps([matched_gid]),
+                                "value": json.dumps(all_gids),
                                 "type": mf_type,
                             })
-                        else:
-                            available = [mo.get("displayName") for mo in mo_nodes[:10]]
+                        if missing:
                             if not metafields_result:
                                 metafields_result = {"metafields_warnings": []}
                             metafields_result.setdefault("metafields_warnings", []).append(
-                                f"Value '{value_name}' not found for shopify.{key} in metaobject type '{mo_type}'. Available: {available}"
+                                f"Values not found for shopify.{key}: {missing}"
                             )
                     except Exception as mf_err:
                         if not metafields_result:
