@@ -466,8 +466,8 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
                     # Get all taxonomy attributes and values for this category
                     tax_query = """
                     query getTax($id: ID!) {
-                      taxonomy {
-                        category(id: $id) {
+                      node(id: $id) {
+                        ... on TaxonomyCategory {
                           attributes(first: 50) {
                             nodes {
                               id
@@ -483,6 +483,8 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
                     }
                     """
                     tax_data = await _graphql(tax_query, variables={"id": cat_id})
+                    # Normalize: node -> taxonomy.category for consistent access
+                    tax_data = {"taxonomy": {"category": tax_data.get("node", {})}}
                     attrs = tax_data.get("taxonomy", {}).get("category", {}).get("attributes", {}).get("nodes", [])
 
                     # Build lookup: attribute handle -> {value_name -> value_gid}
