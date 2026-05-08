@@ -383,6 +383,7 @@ class UpdateProductInput(BaseModel):
     published_at: Optional[str]  = Field(default=None, description="ISO 8601 publish date (e.g. '2026-04-21T09:00:00Z'). Combined with status='active', schedules future publication. Set to null to unpublish.")
     metafields_global_title_tag:       Optional[str] = Field(default=None, description="SEO title tag")
     metafields_global_description_tag: Optional[str] = Field(default=None, description="SEO meta description")
+    metafields: Optional[List[Dict[str, Any]]] = Field(default=None, description="Product metafields for Google Shopping. Each dict needs: namespace, key, value, type. Example: [{\"namespace\": \"shopify\", \"key\": \"target-gender\", \"value\": \"Female\", \"type\": \"string\"}, {\"namespace\": \"shopify\", \"key\": \"dress-occasion\", \"value\": \"Wedding\", \"type\": \"string\"}]. Common keys: age-group, color-pattern, dress-occasion, dress-style, fabric, neckline, skirt-dress-length-type, sleeve-length-type, target-gender, fit.")
 
 async def _get_online_store_publication_id() -> Optional[str]:
     """Fetch the Online Store publication GID via GraphQL. Cached implicitly per-request."""
@@ -432,6 +433,18 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
                 product[field] = val
         if params.published_at is not None and not schedule_date:
             product["published_at"] = params.published_at
+
+        # Add metafields to the product payload if provided
+        if params.metafields:
+            product["metafields"] = [
+                {
+                    "namespace": mf.get("namespace", "shopify"),
+                    "key": mf["key"],
+                    "value": mf["value"],
+                    "type": mf.get("type", "string"),
+                }
+                for mf in params.metafields
+            ]
 
         # When scheduling: keep status as draft via REST so product stays hidden until publishDate
         if schedule_date:
