@@ -470,11 +470,13 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
                         ... on TaxonomyCategory {
                           attributes(first: 50) {
                             nodes {
-                              id
-                              name
-                              handle
-                              values(first: 200) {
-                                nodes { id name }
+                              ... on TaxonomyChoiceListAttribute {
+                                id
+                                name
+                                handle
+                                values(first: 200) {
+                                  nodes { id name }
+                                }
                               }
                             }
                           }
