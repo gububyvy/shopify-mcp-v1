@@ -434,97 +434,114 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
         if params.published_at is not None and not schedule_date:
             product["published_at"] = params.published_at
 
-        # Handle metafields via GraphQL
+        # Handle metafields via GraphQL metafieldsSet
         metafields_result = None
         if params.metafields:
-            # For namespace="shopify" (standard category metafields), we need to:
-            # 1. Get product's taxonomy category
-            # 2. Look up taxonomy attribute value GIDs
-            # 3. Format values as JSON arrays of GIDs
             shopify_mfs = [mf for mf in params.metafields if mf.get("namespace", "shopify") == "shopify" and "type" not in mf]
             custom_mfs = [mf for mf in params.metafields if mf.get("namespace", "shopify") != "shopify" or "type" in mf]
-
             gql_metafields = []
 
-            # Handle standard Shopify taxonomy metafields
+            # Standard Shopify category metafields (list.metaobject_reference)
+            # Need to: 1) get metafield definition 2) find metaobject type 3) lookup GID by name
             if shopify_mfs:
-                # Get product's taxonomy category
-                cat_query = """
-                query getProductCat($id: ID!) {
-                  product(id: $id) {
-                    productCategory {
-                      productTaxonomyNode { id }
-                    }
-                  }
-                }
-                """
-                cat_data = await _graphql(cat_query, variables={"id": f"gid://shopify/Product/{params.product_id}"})
-                cat_node = (cat_data.get("product", {}).get("productCategory") or {}).get("productTaxonomyNode") or {}
-                cat_id = cat_node.get("id")
-
-                if cat_id:
-                    # Get all taxonomy attributes and values for this category
-                    tax_query = """
-                    query getTax($id: ID!) {
-                      node(id: $id) {
-                        ... on TaxonomyCategory {
-                          attributes(first: 50) {
+                for mf in shopify_mfs:
+                    key = mf["key"]
+                    value_name = mf["value"]
+                    try:
+                        # Step 1: Get metafield definition to find the validation metaobject type
+                        def_query = """
+                        query getMfDef($ns: String!, $key: String!) {
+                          metafieldDefinitions(ownerType: PRODUCT, namespace: $ns, key: $key, first: 1) {
                             nodes {
-                              ... on TaxonomyChoiceListAttribute {
-                                id
-                                name
-                                values(first: 200) {
-                                  nodes { id name }
-                                }
-                              }
+                              type { name }
+                              validations { name value }
                             }
                           }
                         }
-                      }
-                    }
-                    """
-                    tax_data = await _graphql(tax_query, variables={"id": cat_id})
-                    # Normalize: node -> taxonomy.category for consistent access
-                    tax_data = {"taxonomy": {"category": tax_data.get("node", {})}}
-                    attrs = tax_data.get("taxonomy", {}).get("category", {}).get("attributes", {}).get("nodes", [])
+                        """
+                        def_data = await _graphql(def_query, variables={"ns": "shopify", "key": key})
+                        def_nodes = def_data.get("metafieldDefinitions", {}).get("nodes", [])
+                        if not def_nodes:
+                            if not metafields_result:
+                                metafields_result = {"metafields_warnings": []}
+                            metafields_result.setdefault("metafields_warnings", []).append(
+                                f"No metafield definition found for shopify.{key}"
+                            )
+                            continue
 
-                    # Build lookup: normalized_name -> {value_name -> value_gid}
-                    # Convert attribute name to key format: "Target gender" -> "target-gender"
-                    attr_lookup = {}
-                    for attr in attrs:
-                        name = attr.get("name", "")
-                        key = name.lower().replace(" ", "-").replace("/", "-")
-                        val_map = {}
-                        for v in attr.get("values", {}).get("nodes", []):
-                            val_map[v.get("name", "").lower()] = v.get("id")
-                        attr_lookup[key] = val_map
+                        mf_def = def_nodes[0]
+                        mf_type = mf_def.get("type", {}).get("name", "")
 
-                    for mf in shopify_mfs:
-                        key = mf["key"]
-                        value_name = mf["value"]
-                        # Find matching attribute values
-                        val_map = attr_lookup.get(key, {})
-                        gid = val_map.get(value_name.lower())
-                        if gid:
+                        # Step 2: Find metaobject type from validations
+                        mo_type = None
+                        for v in mf_def.get("validations", []):
+                            if v.get("name") == "metaobject_definition_id":
+                                # Extract type from the metaobject definition
+                                mo_def_gid = v.get("value", "")
+                                if mo_def_gid:
+                                    # Query the metaobject definition to get its type
+                                    mo_def_query = """
+                                    query getMoDef($id: ID!) {
+                                      node(id: $id) {
+                                        ... on MetaobjectDefinition { type }
+                                      }
+                                    }
+                                    """
+                                    mo_def_data = await _graphql(mo_def_query, variables={"id": mo_def_gid})
+                                    mo_type = mo_def_data.get("node", {}).get("type")
+
+                        if not mo_type:
+                            if not metafields_result:
+                                metafields_result = {"metafields_warnings": []}
+                            metafields_result.setdefault("metafields_warnings", []).append(
+                                f"Could not determine metaobject type for shopify.{key}. Type: {mf_type}"
+                            )
+                            continue
+
+                        # Step 3: Search metaobjects by name to find GID
+                        mo_query = """
+                        query findMO($type: String!, $q: String) {
+                          metaobjects(type: $type, first: 50, query: $q) {
+                            nodes { id displayName }
+                          }
+                        }
+                        """
+                        mo_data = await _graphql(mo_query, variables={"type": mo_type, "q": value_name})
+                        mo_nodes = mo_data.get("metaobjects", {}).get("nodes", [])
+
+                        # Find exact match by displayName
+                        matched_gid = None
+                        for mo in mo_nodes:
+                            if mo.get("displayName", "").lower() == value_name.lower():
+                                matched_gid = mo.get("id")
+                                break
+                        # Fallback: first result
+                        if not matched_gid and mo_nodes:
+                            matched_gid = mo_nodes[0].get("id")
+
+                        if matched_gid:
                             gql_metafields.append({
                                 "ownerId": f"gid://shopify/Product/{params.product_id}",
                                 "namespace": "shopify",
                                 "key": key,
-                                "value": json.dumps([gid]),
-                                "type": "list.metaobject_reference",
+                                "value": json.dumps([matched_gid]),
+                                "type": mf_type,
                             })
                         else:
-                            # Value not found in taxonomy — skip with warning
+                            available = [mo.get("displayName") for mo in mo_nodes[:10]]
                             if not metafields_result:
                                 metafields_result = {"metafields_warnings": []}
                             metafields_result.setdefault("metafields_warnings", []).append(
-                                f"Value '{value_name}' not found for attribute '{key}'. "
-                                f"Available attributes: {list(attr_lookup.keys())[:15]}. "
-                                f"Available values for '{key}': {list(val_map.keys())[:10]}. "
-                                f"Category ID: {cat_id}"
+                                f"Value '{value_name}' not found for shopify.{key} in metaobject type '{mo_type}'. Available: {available}"
                             )
+                    except Exception as mf_err:
+                        if not metafields_result:
+                            metafields_result = {"metafields_warnings": []}
+                        metafields_result.setdefault("metafields_warnings", []).append(
+                            f"Error resolving shopify.{key}: {str(mf_err)}"
+                        )
 
-            # Handle custom metafields (non-shopify namespace or explicit type)
+            # Custom metafields (non-shopify namespace or explicit type)
             for mf in custom_mfs:
                 entry = {
                     "ownerId": f"gid://shopify/Product/{params.product_id}",
