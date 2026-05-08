@@ -2336,8 +2336,106 @@ async def shopify_delete_redirect(params: DeleteRedirectInput) -> str:
 # Product Metafields via GraphQL (Category Metafields for Google Shopping)
 # ---------------------------------------------------------------------------
 # Shopify category metafields use taxonomy references (metaobject GIDs).
-# We use GraphQL productUpdate with metafields input which handles the
-# taxonomy lookup internally when using the correct namespace/key.
+# We use GraphQL metafieldsSet + taxonomy lookup for standard metafields.
+
+class TaxonomyLookupInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    category_id: str = Field(..., description="Product category taxonomy GID, e.g. 'gid://shopify/TaxonomyCategory/1234'. Get from product.productCategory via GraphQL.")
+    attribute_name: Optional[str] = Field(default=None, description="Filter by attribute name, e.g. 'Neckline', 'Target gender', 'Dress occasion'. Leave empty to list all attributes.")
+
+@mcp.tool(
+    name="shopify_lookup_taxonomy",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_lookup_taxonomy(params: TaxonomyLookupInput) -> str:
+    """Look up available taxonomy attribute values for a product category.
+
+    First get the category GID from a product via GraphQL, then use this tool
+    to find valid values (with their GIDs) for metafields like target-gender,
+    dress-occasion, neckline, etc.
+
+    Returns attribute names and their valid values with GIDs.
+    """
+    try:
+        query = """
+        query getTaxonomy($id: ID!) {
+          taxonomy {
+            category(id: $id) {
+              id
+              name
+              attributes(first: 50) {
+                nodes {
+                  id
+                  name
+                  values(first: 100) {
+                    nodes {
+                      id
+                      name
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+        data = await _graphql(query, variables={"id": params.category_id})
+        cat = data.get("taxonomy", {}).get("category", {})
+        if not cat:
+            return _error(Exception(f"Category {params.category_id} not found"))
+
+        result = {"category": cat.get("name"), "id": cat.get("id"), "attributes": []}
+        for attr in cat.get("attributes", {}).get("nodes", []):
+            if params.attribute_name and params.attribute_name.lower() not in attr.get("name", "").lower():
+                continue
+            result["attributes"].append({
+                "name": attr.get("name"),
+                "id": attr.get("id"),
+                "values": [{"name": v.get("name"), "id": v.get("id")} for v in attr.get("values", {}).get("nodes", [])]
+            })
+        return _fmt(result)
+    except Exception as e:
+        return _error(e)
+
+class GetProductCategoryInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    product_id: int = Field(..., description="The Shopify product ID")
+
+@mcp.tool(
+    name="shopify_get_product_category",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_get_product_category(params: GetProductCategoryInput) -> str:
+    """Get a product's category (taxonomy) and its current metafields.
+    Returns the category GID (needed for taxonomy lookup) and current metafield values."""
+    try:
+        query = """
+        query getProduct($id: ID!) {
+          product(id: $id) {
+            id
+            title
+            productCategory {
+              productTaxonomyNode {
+                id
+                name
+                fullName
+              }
+            }
+            metafields(first: 30) {
+              nodes {
+                namespace
+                key
+                value
+                type
+              }
+            }
+          }
+        }
+        """
+        data = await _graphql(query, variables={"id": f"gid://shopify/Product/{params.product_id}"})
+        return _fmt(data.get("product", data))
+    except Exception as e:
+        return _error(e)
 
 
 # ---------------------------------------------------------------------------
