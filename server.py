@@ -2300,7 +2300,7 @@ async def shopify_delete_redirect(params: DeleteRedirectInput) -> str:
 class SetProductMetafieldInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     product_id: int = Field(..., description="The Shopify product ID")
-    metafields: List[Dict[str, str]] = Field(
+    metafields: List[Dict[str, Any]] = Field(
         ...,
         description=(
             "List of metafield objects to set. Each object needs: "
