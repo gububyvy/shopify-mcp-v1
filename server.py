@@ -473,7 +473,6 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
                               ... on TaxonomyChoiceListAttribute {
                                 id
                                 name
-                                handle
                                 values(first: 200) {
                                   nodes { id name }
                                 }
@@ -489,14 +488,16 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
                     tax_data = {"taxonomy": {"category": tax_data.get("node", {})}}
                     attrs = tax_data.get("taxonomy", {}).get("category", {}).get("attributes", {}).get("nodes", [])
 
-                    # Build lookup: attribute handle -> {value_name -> value_gid}
+                    # Build lookup: normalized_name -> {value_name -> value_gid}
+                    # Convert attribute name to key format: "Target gender" -> "target-gender"
                     attr_lookup = {}
                     for attr in attrs:
-                        handle = attr.get("handle", "")
+                        name = attr.get("name", "")
+                        key = name.lower().replace(" ", "-").replace("/", "-")
                         val_map = {}
                         for v in attr.get("values", {}).get("nodes", []):
                             val_map[v.get("name", "").lower()] = v.get("id")
-                        attr_lookup[handle] = val_map
+                        attr_lookup[key] = val_map
 
                     for mf in shopify_mfs:
                         key = mf["key"]
