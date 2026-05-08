@@ -518,7 +518,10 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
                             if not metafields_result:
                                 metafields_result = {"metafields_warnings": []}
                             metafields_result.setdefault("metafields_warnings", []).append(
-                                f"Value '{value_name}' not found for attribute '{key}'. Available: {list(val_map.keys())[:10]}"
+                                f"Value '{value_name}' not found for attribute '{key}'. "
+                                f"Available attributes: {list(attr_lookup.keys())[:15]}. "
+                                f"Available values for '{key}': {list(val_map.keys())[:10]}. "
+                                f"Category ID: {cat_id}"
                             )
 
             # Handle custom metafields (non-shopify namespace or explicit type)
