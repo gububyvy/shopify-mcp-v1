@@ -2446,8 +2446,8 @@ async def shopify_lookup_taxonomy(params: TaxonomyLookupInput) -> str:
     try:
         query = """
         query getTaxonomy($id: ID!) {
-          taxonomy {
-            category(id: $id) {
+          node(id: $id) {
+            ... on TaxonomyCategory {
               id
               name
               attributes(first: 50) {
@@ -2467,7 +2467,7 @@ async def shopify_lookup_taxonomy(params: TaxonomyLookupInput) -> str:
         }
         """
         data = await _graphql(query, variables={"id": params.category_id})
-        cat = data.get("taxonomy", {}).get("category", {})
+        cat = data.get("node", {})
         if not cat:
             return _error(Exception(f"Category {params.category_id} not found"))
 
