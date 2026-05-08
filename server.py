@@ -434,38 +434,36 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
         if params.published_at is not None and not schedule_date:
             product["published_at"] = params.published_at
 
-        # Handle metafields via GraphQL productUpdate (category metafields use taxonomy refs)
+        # Handle metafields via GraphQL metafieldsSet mutation
         metafields_result = None
         if params.metafields:
             gql_metafields = []
             for mf in params.metafields:
-                gql_metafields.append({
+                entry = {
+                    "ownerId": f"gid://shopify/Product/{params.product_id}",
                     "namespace": mf.get("namespace", "shopify"),
                     "key": mf["key"],
                     "value": mf["value"],
-                    "type": mf.get("type", "single_line_text_field"),
-                })
+                }
+                # Only include type if explicitly provided (omit for existing definitions)
+                if "type" in mf:
+                    entry["type"] = mf["type"]
+                gql_metafields.append(entry)
             gql_query = """
-            mutation productUpdate($input: ProductInput!) {
-              productUpdate(input: $input) {
-                product { id title metafields(first: 30) { nodes { namespace key value type } } }
+            mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
+              metafieldsSet(metafields: $metafields) {
+                metafields { id namespace key value type }
                 userErrors { field message }
               }
             }
             """
-            gql_vars = {
-                "input": {
-                    "id": f"gid://shopify/Product/{params.product_id}",
-                    "metafields": gql_metafields,
-                }
-            }
-            gql_data = await _graphql(gql_query, variables=gql_vars)
-            user_errors = gql_data.get("productUpdate", {}).get("userErrors", [])
+            gql_data = await _graphql(gql_query, variables={"metafields": gql_metafields})
+            user_errors = gql_data.get("metafieldsSet", {}).get("userErrors", [])
             if user_errors:
                 metafields_result = {"metafields_errors": user_errors}
             else:
-                mf_nodes = gql_data.get("productUpdate", {}).get("product", {}).get("metafields", {}).get("nodes", [])
-                metafields_result = {"metafields_set": len(gql_metafields), "current_metafields": mf_nodes}
+                set_mfs = gql_data.get("metafieldsSet", {}).get("metafields", [])
+                metafields_result = {"metafields_set": len(set_mfs), "metafields": set_mfs}
 
         # When scheduling: keep status as draft via REST so product stays hidden until publishDate
         if schedule_date:
