@@ -434,36 +434,121 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
         if params.published_at is not None and not schedule_date:
             product["published_at"] = params.published_at
 
-        # Handle metafields via GraphQL metafieldsSet mutation
+        # Handle metafields via GraphQL
         metafields_result = None
         if params.metafields:
+            # For namespace="shopify" (standard category metafields), we need to:
+            # 1. Get product's taxonomy category
+            # 2. Look up taxonomy attribute value GIDs
+            # 3. Format values as JSON arrays of GIDs
+            shopify_mfs = [mf for mf in params.metafields if mf.get("namespace", "shopify") == "shopify" and "type" not in mf]
+            custom_mfs = [mf for mf in params.metafields if mf.get("namespace", "shopify") != "shopify" or "type" in mf]
+
             gql_metafields = []
-            for mf in params.metafields:
+
+            # Handle standard Shopify taxonomy metafields
+            if shopify_mfs:
+                # Get product's taxonomy category
+                cat_query = """
+                query getProductCat($id: ID!) {
+                  product(id: $id) {
+                    productCategory {
+                      productTaxonomyNode { id }
+                    }
+                  }
+                }
+                """
+                cat_data = await _graphql(cat_query, variables={"id": f"gid://shopify/Product/{params.product_id}"})
+                cat_node = (cat_data.get("product", {}).get("productCategory") or {}).get("productTaxonomyNode") or {}
+                cat_id = cat_node.get("id")
+
+                if cat_id:
+                    # Get all taxonomy attributes and values for this category
+                    tax_query = """
+                    query getTax($id: ID!) {
+                      taxonomy {
+                        category(id: $id) {
+                          attributes(first: 50) {
+                            nodes {
+                              id
+                              name
+                              handle
+                              values(first: 200) {
+                                nodes { id name }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                    """
+                    tax_data = await _graphql(tax_query, variables={"id": cat_id})
+                    attrs = tax_data.get("taxonomy", {}).get("category", {}).get("attributes", {}).get("nodes", [])
+
+                    # Build lookup: attribute handle -> {value_name -> value_gid}
+                    attr_lookup = {}
+                    for attr in attrs:
+                        handle = attr.get("handle", "")
+                        val_map = {}
+                        for v in attr.get("values", {}).get("nodes", []):
+                            val_map[v.get("name", "").lower()] = v.get("id")
+                        attr_lookup[handle] = val_map
+
+                    for mf in shopify_mfs:
+                        key = mf["key"]
+                        value_name = mf["value"]
+                        # Find matching attribute values
+                        val_map = attr_lookup.get(key, {})
+                        gid = val_map.get(value_name.lower())
+                        if gid:
+                            gql_metafields.append({
+                                "ownerId": f"gid://shopify/Product/{params.product_id}",
+                                "namespace": "shopify",
+                                "key": key,
+                                "value": json.dumps([gid]),
+                                "type": "list.metaobject_reference",
+                            })
+                        else:
+                            # Value not found in taxonomy — skip with warning
+                            if not metafields_result:
+                                metafields_result = {"metafields_warnings": []}
+                            metafields_result.setdefault("metafields_warnings", []).append(
+                                f"Value '{value_name}' not found for attribute '{key}'. Available: {list(val_map.keys())[:10]}"
+                            )
+
+            # Handle custom metafields (non-shopify namespace or explicit type)
+            for mf in custom_mfs:
                 entry = {
                     "ownerId": f"gid://shopify/Product/{params.product_id}",
-                    "namespace": mf.get("namespace", "shopify"),
+                    "namespace": mf.get("namespace", "custom"),
                     "key": mf["key"],
                     "value": mf["value"],
                 }
-                # Only include type if explicitly provided (omit for existing definitions)
                 if "type" in mf:
                     entry["type"] = mf["type"]
                 gql_metafields.append(entry)
-            gql_query = """
-            mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
-              metafieldsSet(metafields: $metafields) {
-                metafields { id namespace key value type }
-                userErrors { field message }
-              }
-            }
-            """
-            gql_data = await _graphql(gql_query, variables={"metafields": gql_metafields})
-            user_errors = gql_data.get("metafieldsSet", {}).get("userErrors", [])
-            if user_errors:
-                metafields_result = {"metafields_errors": user_errors}
-            else:
-                set_mfs = gql_data.get("metafieldsSet", {}).get("metafields", [])
-                metafields_result = {"metafields_set": len(set_mfs), "metafields": set_mfs}
+
+            if gql_metafields:
+                gql_query = """
+                mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
+                  metafieldsSet(metafields: $metafields) {
+                    metafields { id namespace key value type }
+                    userErrors { field message }
+                  }
+                }
+                """
+                gql_data = await _graphql(gql_query, variables={"metafields": gql_metafields})
+                user_errors = gql_data.get("metafieldsSet", {}).get("userErrors", [])
+                if user_errors:
+                    if not metafields_result:
+                        metafields_result = {}
+                    metafields_result["metafields_errors"] = user_errors
+                else:
+                    set_mfs = gql_data.get("metafieldsSet", {}).get("metafields", [])
+                    if not metafields_result:
+                        metafields_result = {}
+                    metafields_result["metafields_set"] = len(set_mfs)
+                    metafields_result["metafields"] = set_mfs
 
         # When scheduling: keep status as draft via REST so product stays hidden until publishDate
         if schedule_date:
