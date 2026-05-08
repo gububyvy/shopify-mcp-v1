@@ -434,17 +434,38 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
         if params.published_at is not None and not schedule_date:
             product["published_at"] = params.published_at
 
-        # Add metafields to the product payload if provided
+        # Handle metafields via GraphQL productUpdate (category metafields use taxonomy refs)
+        metafields_result = None
         if params.metafields:
-            product["metafields"] = [
-                {
+            gql_metafields = []
+            for mf in params.metafields:
+                gql_metafields.append({
                     "namespace": mf.get("namespace", "shopify"),
                     "key": mf["key"],
                     "value": mf["value"],
-                    "type": mf.get("type", "string"),
+                    "type": mf.get("type", "single_line_text_field"),
+                })
+            gql_query = """
+            mutation productUpdate($input: ProductInput!) {
+              productUpdate(input: $input) {
+                product { id title metafields(first: 30) { nodes { namespace key value type } } }
+                userErrors { field message }
+              }
+            }
+            """
+            gql_vars = {
+                "input": {
+                    "id": f"gid://shopify/Product/{params.product_id}",
+                    "metafields": gql_metafields,
                 }
-                for mf in params.metafields
-            ]
+            }
+            gql_data = await _graphql(gql_query, variables=gql_vars)
+            user_errors = gql_data.get("productUpdate", {}).get("userErrors", [])
+            if user_errors:
+                metafields_result = {"metafields_errors": user_errors}
+            else:
+                mf_nodes = gql_data.get("productUpdate", {}).get("product", {}).get("metafields", {}).get("nodes", [])
+                metafields_result = {"metafields_set": len(gql_metafields), "current_metafields": mf_nodes}
 
         # When scheduling: keep status as draft via REST so product stays hidden until publishDate
         if schedule_date:
@@ -540,7 +561,10 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
             prod["_scheduled"] = {"publishDate": schedule_date, "publicationId": pub_id}
             return _fmt(prod)
 
-        return _fmt(data.get("product", data))
+        result = data.get("product", data)
+        if metafields_result:
+            result["_metafields"] = metafields_result
+        return _fmt(result)
     except Exception as e:
         return _error(e)
 
@@ -2307,112 +2331,11 @@ async def shopify_delete_redirect(params: DeleteRedirectInput) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Product Metafields (Category Metafields for Google Shopping)
+# Product Metafields via GraphQL (Category Metafields for Google Shopping)
 # ---------------------------------------------------------------------------
-
-class SetProductMetafieldInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    product_id: int = Field(..., description="The Shopify product ID")
-    metafields: List[Dict[str, Any]] = Field(
-        ...,
-        description=(
-            "List of metafield objects to set. Each object needs: "
-            "namespace, key, value, type. "
-            "For category metafields use namespace='shopify'. "
-            "Common keys: age-group, color-pattern, dress-occasion, dress-style, "
-            "fabric, fit, neckline, occasion-style, skirt-dress-length-type, "
-            "sleeve-length-type, target-gender. "
-            "Example: {\"namespace\": \"shopify\", \"key\": \"dress-occasion\", "
-            "\"value\": \"Wedding\", \"type\": \"string\"}"
-        ),
-    )
-
-class GetProductMetafieldsInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    product_id: int = Field(..., description="The Shopify product ID")
-
-@mcp.tool(
-    name="shopify_get_product_metafields",
-    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
-)
-async def shopify_get_product_metafields(params: GetProductMetafieldsInput) -> str:
-    """Get all metafields for a product. Returns category metafields (Google Shopping attributes)
-    like age-group, color-pattern, dress-occasion, neckline, etc."""
-    try:
-        data = await _request("GET", f"products/{params.product_id}/metafields.json")
-        return _fmt(data)
-    except Exception as e:
-        return _error(e)
-
-@mcp.tool(
-    name="shopify_set_product_metafields",
-    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
-)
-async def shopify_set_product_metafields(params: SetProductMetafieldInput) -> str:
-    """Set or update metafields on a product. Upserts: creates if new, updates if exists.
-
-    Use for Google Shopping category metafields (namespace='shopify'):
-      - age-group: Adults / Kids / Toddler / Infant / Newborn
-      - color-pattern: e.g. Floral, Black, Blue
-      - dress-occasion: e.g. Wedding, Party, Casual, Cocktail, Formal
-      - dress-style: e.g. A-line, Bodycon, Wrap, Shift, Sheath
-      - fabric: e.g. Cotton, Polyester, Linen, Chiffon
-      - neckline: e.g. V-neck, Square, Round, Halter, Off-shoulder, Sweetheart
-      - occasion-style: e.g. Formal, Casual, Business
-      - skirt-dress-length-type: e.g. Maxi, Midi, Mini, Floor-length
-      - sleeve-length-type: e.g. Sleeveless, Short sleeve, Long sleeve, Spaghetti strap
-      - target-gender: Female / Male / Unisex
-      - fit: e.g. Regular, Slim, Relaxed
-
-    Example:
-      metafields=[
-        {"namespace": "shopify", "key": "target-gender", "value": "Female", "type": "string"},
-        {"namespace": "shopify", "key": "dress-occasion", "value": "Wedding", "type": "string"},
-        {"namespace": "shopify", "key": "neckline", "value": "Halter", "type": "string"}
-      ]
-    """
-    try:
-        results = []
-        for mf in params.metafields:
-            body = {
-                "metafield": {
-                    "namespace": mf.get("namespace", "shopify"),
-                    "key": mf["key"],
-                    "value": mf["value"],
-                    "type": mf.get("type", "string"),
-                }
-            }
-            # Try to find existing metafield to update instead of creating duplicate
-            try:
-                existing = await _request("GET", f"products/{params.product_id}/metafields.json")
-                existing_mf = None
-                for emf in existing.get("metafields", []):
-                    if emf.get("namespace") == mf.get("namespace", "shopify") and emf.get("key") == mf["key"]:
-                        existing_mf = emf
-                        break
-                if existing_mf:
-                    data = await _request(
-                        "PUT",
-                        f"products/{params.product_id}/metafields/{existing_mf['id']}.json",
-                        body=body,
-                    )
-                else:
-                    data = await _request(
-                        "POST",
-                        f"products/{params.product_id}/metafields.json",
-                        body=body,
-                    )
-            except Exception:
-                # Fallback: just POST (Shopify may handle upsert)
-                data = await _request(
-                    "POST",
-                    f"products/{params.product_id}/metafields.json",
-                    body=body,
-                )
-            results.append({"key": mf["key"], "value": mf["value"], "status": "ok"})
-        return _fmt({"product_id": params.product_id, "metafields_set": results})
-    except Exception as e:
-        return _error(e)
+# Shopify category metafields use taxonomy references (metaobject GIDs).
+# We use GraphQL productUpdate with metafields input which handles the
+# taxonomy lookup internally when using the correct namespace/key.
 
 
 # ---------------------------------------------------------------------------
