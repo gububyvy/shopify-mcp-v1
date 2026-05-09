@@ -514,19 +514,46 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
                         all_gids = []
                         missing = []
                         for value_name in value_names:
+                            # First try: search with query parameter
                             mo_data = await _graphql(mo_query, variables={"type": mo_type, "q": value_name})
                             mo_nodes = mo_data.get("metaobjects", {}).get("nodes", [])
                             matched_gid = None
+                            # Exact match on displayName (case-insensitive)
                             for mo in mo_nodes:
-                                if mo.get("displayName", "").lower() == value_name.lower():
+                                if mo.get("displayName", "").lower().strip() == value_name.lower().strip():
                                     matched_gid = mo.get("id")
                                     break
-                            if not matched_gid and mo_nodes:
-                                matched_gid = mo_nodes[0].get("id")
+                            # If no exact match, try contains match
+                            if not matched_gid:
+                                for mo in mo_nodes:
+                                    dn = mo.get("displayName", "").lower().strip()
+                                    vn = value_name.lower().strip()
+                                    if vn in dn or dn in vn:
+                                        matched_gid = mo.get("id")
+                                        break
+                            # If still no match, fetch ALL metaobjects of this type and search
+                            if not matched_gid:
+                                mo_all = await _graphql(mo_query, variables={"type": mo_type, "q": None})
+                                mo_all_nodes = mo_all.get("metaobjects", {}).get("nodes", [])
+                                for mo in mo_all_nodes:
+                                    if mo.get("displayName", "").lower().strip() == value_name.lower().strip():
+                                        matched_gid = mo.get("id")
+                                        break
+                                # Contains fallback on full list
+                                if not matched_gid:
+                                    for mo in mo_all_nodes:
+                                        dn = mo.get("displayName", "").lower().strip()
+                                        vn = value_name.lower().strip()
+                                        if vn in dn or dn in vn:
+                                            matched_gid = mo.get("id")
+                                            break
+                            # NEVER fall back to first random result
                             if matched_gid:
                                 all_gids.append(matched_gid)
                             else:
-                                missing.append(value_name)
+                                # Report available values so caller knows what to use
+                                avail = [mo.get("displayName") for mo in mo_nodes[:20]]
+                                missing.append(f"{value_name} (available: {avail})")
 
                         if all_gids:
                             gql_metafields.append({
