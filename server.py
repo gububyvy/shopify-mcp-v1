@@ -203,27 +203,41 @@ async def _request(
             "Set it before starting the server."
         )
 
-    url     = f"{_base_url()}/{path}"
-    headers = await _headers()
+    url = f"{_base_url()}/{path}"
+    MAX_429_RETRIES = 5
 
     async with httpx.AsyncClient() as client:
-        resp = await client.request(
-            method, url,
-            headers=headers,
-            params=params,
-            json=body,
-            timeout=30.0,
-        )
+        for attempt in range(MAX_429_RETRIES + 1):
+            headers = await _headers()
+            resp = await client.request(
+                method, url,
+                headers=headers,
+                params=params,
+                json=body,
+                timeout=30.0,
+            )
 
-        if resp.status_code == 401 and not _retried and token_manager._use_client_credentials:
-            logger.warning("Got 401 — refreshing token and retrying...")
-            await token_manager.force_refresh()
-            return await _request(method, path, params=params, body=body, _retried=True)
+            if resp.status_code == 401 and not _retried and token_manager._use_client_credentials:
+                logger.warning("Got 401 — refreshing token and retrying...")
+                await token_manager.force_refresh()
+                return await _request(method, path, params=params, body=body, _retried=True)
 
-        resp.raise_for_status()
-        if resp.status_code == 204:
-            return {}
-        return resp.json()
+            # REST is hard-capped (2/s; 4/s Plus). On 429, honour Retry-After and
+            # retry instead of failing — lets concurrent bulk edits ride the limit.
+            if resp.status_code == 429 and attempt < MAX_429_RETRIES:
+                retry_after = resp.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after else 1.0 * (attempt + 1)
+                logger.warning(f"REST 429 — waiting {wait:.1f}s (retry {attempt + 1}/{MAX_429_RETRIES})")
+                await asyncio.sleep(wait)
+                continue
+
+            resp.raise_for_status()
+            if resp.status_code == 204:
+                return {}
+            return resp.json()
+
+    # Exhausted retries — surface the last 429 as an error.
+    raise RuntimeError("Shopify REST rate limit: still 429 after retries")
 
 
 async def _graphql(
@@ -236,26 +250,57 @@ async def _graphql(
         raise RuntimeError("Missing SHOPIFY_STORE environment variable.")
 
     url = f"{_base_url()}/graphql.json"
-    headers = await _headers()
     payload: Dict[str, Any] = {"query": query}
     if variables:
         payload["variables"] = variables
+    MAX_RETRIES = 5
 
     async with httpx.AsyncClient() as client:
-        resp = await client.post(url, headers=headers, json=payload, timeout=30.0)
+        for attempt in range(MAX_RETRIES + 1):
+            headers = await _headers()
+            resp = await client.post(url, headers=headers, json=payload, timeout=30.0)
 
-        if resp.status_code == 401 and not _retried and token_manager._use_client_credentials:
-            logger.warning("GraphQL 401 — refreshing token and retrying...")
-            await token_manager.force_refresh()
-            return await _graphql(query, variables=variables, _retried=True)
+            if resp.status_code == 401 and not _retried and token_manager._use_client_credentials:
+                logger.warning("GraphQL 401 — refreshing token and retrying...")
+                await token_manager.force_refresh()
+                return await _graphql(query, variables=variables, _retried=True)
 
-        resp.raise_for_status()
-        data = resp.json()
+            if resp.status_code == 429 and attempt < MAX_RETRIES:
+                retry_after = resp.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after else 1.0 * (attempt + 1)
+                logger.warning(f"GraphQL HTTP 429 — waiting {wait:.1f}s")
+                await asyncio.sleep(wait)
+                continue
 
-        if "errors" in data:
-            raise RuntimeError(f"GraphQL errors: {json.dumps(data['errors'])}")
+            resp.raise_for_status()
+            data = resp.json()
 
-        return data.get("data", data)
+            if "errors" in data:
+                # Shopify returns GraphQL COST throttling as HTTP 200 + errors:THROTTLED
+                # (not a 429). Wait for the cost bucket to refill, then retry.
+                errs = data["errors"] if isinstance(data["errors"], list) else []
+                throttled = any(
+                    (isinstance(e, dict) and (e.get("extensions", {}).get("code") == "THROTTLED"
+                     or "throttl" in str(e.get("message", "")).lower()))
+                    for e in errs
+                )
+                if throttled and attempt < MAX_RETRIES:
+                    cost = (data.get("extensions") or {}).get("cost") or {}
+                    ts = cost.get("throttleStatus") or {}
+                    need = cost.get("requestedQueryCost")
+                    avail = ts.get("currentlyAvailable")
+                    rate = ts.get("restoreRate") or 50
+                    wait = 1.0 * (attempt + 1)
+                    if isinstance(need, (int, float)) and isinstance(avail, (int, float)) and need > avail and rate > 0:
+                        wait = min(6.0, (need - avail) / rate + 0.2)
+                    logger.warning(f"GraphQL THROTTLED — waiting {wait:.1f}s")
+                    await asyncio.sleep(wait)
+                    continue
+                raise RuntimeError(f"GraphQL errors: {json.dumps(data['errors'])}")
+
+            return data.get("data", data)
+
+    raise RuntimeError("GraphQL cost limit: still throttled after retries")
 
 
 def _error(e: Exception) -> str:
@@ -842,6 +887,100 @@ async def shopify_bulk_delete_variants(params: BulkDeleteVariantsInput) -> str:
         })
     except Exception as e:
         return _error(e)
+
+
+class BulkProductEditItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    product_id: int = Field(..., description="Numeric product ID")
+    title:        Optional[str] = Field(default=None)
+    body_html:    Optional[str] = Field(default=None)
+    vendor:       Optional[str] = Field(default=None)
+    product_type: Optional[str] = Field(default=None)
+    tags:         Optional[str] = Field(default=None, description="Comma-separated tags (replaces all)")
+    status:       Optional[str] = Field(default=None, description="active | draft | archived")
+    handle:       Optional[str] = Field(default=None)
+    metafields_global_title_tag:       Optional[str] = Field(default=None, description="SEO title")
+    metafields_global_description_tag: Optional[str] = Field(default=None, description="SEO description")
+    variants:     Optional[List[Dict[str, Any]]] = Field(default=None, description="Variant updates [{id, price, compareAtPrice, sku, barcode, taxable, inventoryPolicy}] via GraphQL productVariantsBulkUpdate")
+
+
+class BulkEditProductsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    edits: List[BulkProductEditItem] = Field(..., description="Per-product edits, applied concurrently server-side")
+    concurrency: int = Field(default=8, ge=1, le=20, description="Max products edited in parallel")
+
+
+@mcp.tool(
+    name="shopify_bulk_edit_products",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_bulk_edit_products(params: BulkEditProductsInput) -> str:
+    """Edit MANY products in ONE call — applied CONCURRENTLY server-side with automatic
+    rate-limit backoff. Use this instead of calling shopify_update_product once per product:
+    a batch of dozens/hundreds runs near the Shopify rate limit instead of one slow call at a
+    time.
+
+    Each edit: scalar fields (title, body_html, vendor, product_type, tags, status, handle,
+    SEO title/description) are sent in one REST product PUT; optional `variants` go through
+    GraphQL productVariantsBulkUpdate. (For complex category/metaobject metafields, use
+    shopify_update_product per product.)
+
+    Example — set 50 products to draft:
+      edits=[{"product_id": 111, "status": "draft"}, {"product_id": 222, "status": "draft"}, ...]
+    """
+    SCALAR = ["title", "body_html", "vendor", "product_type", "tags", "status", "handle",
+              "metafields_global_title_tag", "metafields_global_description_tag"]
+    sem = asyncio.Semaphore(params.concurrency)
+
+    async def apply_one(item: BulkProductEditItem) -> Dict[str, Any]:
+        async with sem:
+            try:
+                product: Dict[str, Any] = {}
+                for f in SCALAR:
+                    v = getattr(item, f)
+                    if v is not None:
+                        product[f] = v
+                if product:
+                    await _request("PUT", f"products/{item.product_id}.json",
+                                   body={"product": {"id": item.product_id, **product}})
+                if item.variants:
+                    gql_variants = []
+                    for v in item.variants:
+                        vid = v.get("id")
+                        if vid is None:
+                            continue
+                        entry: Dict[str, Any] = {"id": f"gid://shopify/ProductVariant/{vid}"}
+                        for key in ("price", "compareAtPrice", "barcode", "sku", "taxable", "inventoryPolicy"):
+                            if key in v:
+                                entry[key] = v[key]
+                        gql_variants.append(entry)
+                    if gql_variants:
+                        mutation = """
+                        mutation pvbu($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+                          productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+                            userErrors { field message }
+                          }
+                        }
+                        """
+                        d = await _graphql(mutation, variables={
+                            "productId": f"gid://shopify/Product/{item.product_id}",
+                            "variants": gql_variants,
+                        })
+                        ue = (d.get("productVariantsBulkUpdate") or {}).get("userErrors") or []
+                        if ue:
+                            return {"product_id": item.product_id, "ok": False, "error": json.dumps(ue)[:300]}
+                return {"product_id": item.product_id, "ok": True}
+            except Exception as e:
+                return {"product_id": item.product_id, "ok": False, "error": str(e)[:300]}
+
+    results = await asyncio.gather(*[apply_one(e) for e in params.edits])
+    failed = [r for r in results if not r.get("ok")]
+    return _fmt({
+        "total": len(results),
+        "succeeded": len(results) - len(failed),
+        "failed": len(failed),
+        "errors": failed[:20],
+    })
 
 
 # ---------------------------------------------------------------------------
