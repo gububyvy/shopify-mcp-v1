@@ -1074,6 +1074,80 @@ async def shopify_schedule_product(params: ScheduleProductInput) -> str:
         return _error(e)
 
 
+class BulkPublishProductsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    product_ids:    List[int] = Field(..., description="Numeric product IDs to publish/schedule")
+    publish_date:   Optional[str] = Field(default=None, description="ISO 8601 datetime to schedule (e.g. '2026-04-25T09:00:00Z'). Omit to publish NOW.")
+    publication_id: Optional[str] = Field(default=None, description="Publication GID. Omit to auto-resolve the Online Store channel.")
+    set_active:     bool = Field(default=True, description="Set each product status=active first (required to publish drafts).")
+    concurrency:    int = Field(default=8, ge=1, le=20, description="Max products published in parallel")
+
+
+@mcp.tool(
+    name="shopify_bulk_publish_products",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_bulk_publish_products(params: BulkPublishProductsInput) -> str:
+    """Publish or SCHEDULE MANY products in ONE call — applied CONCURRENTLY server-side with
+    rate-limit backoff. Use this for "publish/schedule all draft products" instead of calling
+    shopify_schedule_product once per product (which is one slow round-trip each).
+
+    - Publish now: omit publish_date.
+    - Schedule: set publish_date to a future ISO datetime (product goes active now but only
+      appears on the channel at that date).
+    The Online Store publication is auto-resolved once; set_active=True flips drafts to active
+    first (required before publishing). Per-product errors are returned, not fatal.
+    """
+    try:
+        pub_id = params.publication_id
+        if not pub_id:
+            d = await _graphql("query { publications(first: 25) { nodes { id name } } }")
+            nodes = (d.get("publications") or {}).get("nodes") or []
+            online = next((n for n in nodes if "online store" in str(n.get("name", "")).lower()), None)
+            chosen = online or (nodes[0] if nodes else None)
+            if not chosen:
+                return _error(Exception("No sales-channel publication found to publish to."))
+            pub_id = chosen["id"]
+    except Exception as e:
+        return _error(e)
+
+    pub_input: Dict[str, Any] = {"publicationId": pub_id}
+    if params.publish_date is not None:
+        pub_input["publishDate"] = params.publish_date
+    mutation = """
+    mutation pub($id: ID!, $input: [PublicationInput!]!) {
+      publishablePublish(id: $id, input: $input) {
+        userErrors { field message }
+      }
+    }
+    """
+    sem = asyncio.Semaphore(params.concurrency)
+
+    async def publish_one(pid: int) -> Dict[str, Any]:
+        async with sem:
+            try:
+                if params.set_active:
+                    await _request("PUT", f"products/{pid}.json", body={"product": {"id": pid, "status": "active"}})
+                d = await _graphql(mutation, variables={"id": f"gid://shopify/Product/{pid}", "input": [pub_input]})
+                ue = (d.get("publishablePublish") or {}).get("userErrors") or []
+                if ue:
+                    return {"product_id": pid, "ok": False, "error": json.dumps(ue)[:300]}
+                return {"product_id": pid, "ok": True}
+            except Exception as e:
+                return {"product_id": pid, "ok": False, "error": str(e)[:300]}
+
+    results = await asyncio.gather(*[publish_one(p) for p in params.product_ids])
+    failed = [r for r in results if not r.get("ok")]
+    return _fmt({
+        "total": len(results),
+        "succeeded": len(results) - len(failed),
+        "failed": len(failed),
+        "publication_id": pub_id,
+        "scheduled_for": params.publish_date or "now",
+        "errors": failed[:20],
+    })
+
+
 class ProductCountInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     status:       Optional[str] = Field(default=None, description="active, archived, or draft")
