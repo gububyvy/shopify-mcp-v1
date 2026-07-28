@@ -1554,6 +1554,43 @@ async def shopify_update_collection(params: UpdateCollectionInput) -> str:
         return _error(e)
 
 
+class DeleteCollectionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    collection_id: int = Field(..., description="Collection ID (numeric) to delete")
+
+
+@mcp.tool(
+    name="shopify_delete_collection",
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_delete_collection(params: DeleteCollectionInput) -> str:
+    """Delete a collection (custom or smart) by its numeric ID.
+
+    WARNING: destructive and cannot be undone. If the collection was published,
+    its /collections/<handle> URL will start returning 404 — set up a redirect first
+    if the URL may be indexed or used in ads.
+    """
+    try:
+        gid = f"gid://shopify/Collection/{params.collection_id}"
+        query = """
+        mutation collectionDelete($input: CollectionDeleteInput!) {
+          collectionDelete(input: $input) {
+            deletedCollectionId
+            userErrors { field message }
+          }
+        }
+        """
+        data = await _graphql(query, variables={"input": {"id": gid}})
+        result = data.get("collectionDelete", {})
+        errors = result.get("userErrors", [])
+        if errors:
+            return _fmt({"error": errors})
+        return _fmt({"deleted": True, "collection_id": params.collection_id,
+                     "deleted_gid": result.get("deletedCollectionId")})
+    except Exception as e:
+        return _error(e)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # INVENTORY
 # ═══════════════════════════════════════════════════════════════════════════
