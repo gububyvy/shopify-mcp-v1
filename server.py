@@ -1993,6 +1993,14 @@ async def shopify_get_menu(params: GetMenuInput) -> str:
                 url
                 resourceId
                 tags
+                items {
+                  id
+                  title
+                  type
+                  url
+                  resourceId
+                  tags
+                }
               }
             }
           }
