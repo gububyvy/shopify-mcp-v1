@@ -2067,7 +2067,6 @@ async def shopify_create_menu(params: CreateMenuInput) -> str:
               id
               title
               handle
-              itemsCount
               items {
                 id
                 title
