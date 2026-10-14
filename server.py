@@ -1962,6 +1962,211 @@ async def shopify_delete_theme_asset(params: DeleteThemeAssetInput) -> str:
 
 
 # ---------------------------------------------------------------------------
+# FILES (Content > Files, GraphQL Admin API)
+# Requires scopes: read_files, write_files
+#
+# Uploading a local file takes three steps, so the file bytes never pass
+# through the MCP call:
+#   1. shopify_create_staged_upload  -> returns a one-time upload URL + form fields
+#   2. POST the file yourself (multipart: every returned parameter as a form
+#      field, then the file as field "file") to that URL
+#   3. shopify_create_file with original_source = the returned resource_url
+# shopify_create_file also accepts any public https URL as original_source.
+# Theme image settings reference a file as shopify://shop_images/<filename>.
+# ---------------------------------------------------------------------------
+
+class StagedUploadResource(str, Enum):
+    IMAGE = "IMAGE"
+    FILE = "FILE"
+    VIDEO = "VIDEO"
+
+
+class CreateStagedUploadInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    filename: str = Field(..., description="File name as it should appear in Shopify Files, e.g. hero-autumn.jpg")
+    mime_type: str = Field(..., description="MIME type, e.g. image/jpeg, image/png, image/webp")
+    file_size: Optional[int] = Field(default=None, ge=1, description="Size in bytes (required for VIDEO)")
+    resource: StagedUploadResource = Field(default=StagedUploadResource.IMAGE, description="IMAGE, FILE or VIDEO")
+
+
+@mcp.tool(
+    name="shopify_create_staged_upload",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_create_staged_upload(params: CreateStagedUploadInput) -> str:
+    """Step 1 of uploading a local file to Shopify Files: get a one-time upload target.
+
+    Returns url, resource_url and parameters. Upload the file with an HTTP POST
+    (multipart/form-data) to url: send every parameter as a form field in the
+    given order, then the file itself as the field named "file". Then call
+    shopify_create_file with original_source = resource_url.
+    """
+    try:
+        query = """
+        mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
+          stagedUploadsCreate(input: $input) {
+            stagedTargets { url resourceUrl parameters { name value } }
+            userErrors { field message }
+          }
+        }
+        """
+        item: Dict[str, Any] = {
+            "filename": params.filename,
+            "mimeType": params.mime_type,
+            "resource": params.resource.value,
+            "httpMethod": "POST",
+        }
+        if params.file_size is not None:
+            item["fileSize"] = str(params.file_size)
+        data = await _graphql(query, variables={"input": [item]})
+        result = data.get("stagedUploadsCreate", {})
+        errors = result.get("userErrors", [])
+        if errors:
+            return _fmt({"error": errors})
+        targets = result.get("stagedTargets") or []
+        if not targets:
+            return _fmt({"error": "No staged target returned"})
+        t = targets[0]
+        return _fmt({
+            "url": t.get("url"),
+            "resource_url": t.get("resourceUrl"),
+            "parameters": t.get("parameters", []),
+            "next": "POST multipart to url (parameters first, then field 'file'); then shopify_create_file(original_source=resource_url)",
+        })
+    except Exception as e:
+        return _error(e)
+
+
+class FileContentType(str, Enum):
+    IMAGE = "IMAGE"
+    FILE = "FILE"
+    VIDEO = "VIDEO"
+
+
+class CreateFileInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    original_source: str = Field(..., description="resource_url from shopify_create_staged_upload, or a public https URL")
+    content_type: FileContentType = Field(default=FileContentType.IMAGE, description="IMAGE, FILE or VIDEO")
+    alt: Optional[str] = Field(default=None, description="Alt text")
+    wait_seconds: int = Field(default=30, ge=0, le=120, description="Wait up to this long for status READY")
+
+    @field_validator("original_source")
+    @classmethod
+    def _https(cls, v: str) -> str:
+        if not v.startswith("https://"):
+            raise ValueError("original_source must be an https URL")
+        return v
+
+
+_FILE_FIELDS = """
+  id
+  alt
+  fileStatus
+  createdAt
+  fileErrors { code message details }
+  preview { image { url width height } }
+  ... on MediaImage { image { url width height } }
+  ... on GenericFile { url }
+"""
+
+
+def _file_summary(node: dict) -> dict:
+    img = node.get("image") or (node.get("preview") or {}).get("image") or {}
+    url = img.get("url") or node.get("url") or ""
+    name = url.split("?")[0].rsplit("/", 1)[-1] if url else None
+    out = {
+        "id": node.get("id"),
+        "status": node.get("fileStatus"),
+        "alt": node.get("alt"),
+        "url": url or None,
+        "width": img.get("width"),
+        "height": img.get("height"),
+        "filename": name,
+        "theme_reference": f"shopify://shop_images/{name}" if name and node.get("image") else None,
+    }
+    if node.get("fileErrors"):
+        out["errors"] = node["fileErrors"]
+    return out
+
+
+@mcp.tool(
+    name="shopify_create_file",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_create_file(params: CreateFileInput) -> str:
+    """Create a file in Shopify Files (Content > Files) from a staged upload or a public URL.
+
+    Waits until the file is READY (or wait_seconds passes) and returns its id, CDN
+    url, size, file name and, for images, the theme reference
+    shopify://shop_images/<filename>. If a file with the same name already exists,
+    Shopify adds a suffix to the new name; always use the returned filename.
+    """
+    try:
+        mutation = """
+        mutation fileCreate($files: [FileCreateInput!]!) {
+          fileCreate(files: $files) {
+            files { %s }
+            userErrors { field message code }
+          }
+        }
+        """ % _FILE_FIELDS
+        file_input: Dict[str, Any] = {
+            "originalSource": params.original_source,
+            "contentType": params.content_type.value,
+        }
+        if params.alt is not None:
+            file_input["alt"] = params.alt
+        data = await _graphql(mutation, variables={"files": [file_input]})
+        result = data.get("fileCreate", {})
+        errors = result.get("userErrors", [])
+        if errors:
+            return _fmt({"error": errors})
+        files = result.get("files") or []
+        if not files:
+            return _fmt({"error": "No file returned"})
+        node = files[0]
+        file_id = node.get("id")
+
+        query = "query fileNode($id: ID!) { node(id: $id) { %s } }" % _FILE_FIELDS
+        deadline = time.time() + params.wait_seconds
+        while node.get("fileStatus") not in ("READY", "FAILED") and time.time() < deadline:
+            await asyncio.sleep(2)
+            d = await _graphql(query, variables={"id": file_id})
+            node = d.get("node") or node
+        return _fmt(_file_summary(node))
+    except Exception as e:
+        return _error(e)
+
+
+class ListFilesInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    query: Optional[str] = Field(default=None, description="Shopify search syntax, e.g. 'filename:hero*' or 'media_type:IMAGE'")
+    limit: int = Field(default=50, ge=1, le=250, description="Max files to return")
+
+
+@mcp.tool(
+    name="shopify_list_files",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_files(params: ListFilesInput) -> str:
+    """List files in Shopify Files (Content > Files), newest first, with status, CDN url,
+    size and (for images) the theme reference shopify://shop_images/<filename>."""
+    try:
+        query = """
+        query files($first: Int!, $query: String) {
+          files(first: $first, query: $query, sortKey: CREATED_AT, reverse: true) {
+            nodes { %s }
+          }
+        }
+        """ % _FILE_FIELDS
+        data = await _graphql(query, variables={"first": params.limit, "query": params.query})
+        nodes = (data.get("files") or {}).get("nodes", [])
+        return _fmt({"count": len(nodes), "files": [_file_summary(n) for n in nodes]})
+    except Exception as e:
+        return _error(e)
+
+
+# ---------------------------------------------------------------------------
 # NAVIGATION / MENUS (GraphQL Admin API)
 # Requires scopes: read_online_store_navigation, write_online_store_navigation
 # ---------------------------------------------------------------------------
