@@ -13,6 +13,8 @@ Token Management:
 """
 import json
 import os
+import re
+import secrets
 import logging
 import time
 import asyncio
@@ -41,7 +43,75 @@ logger = logging.getLogger("shopify_mcp")
 PORT          = int(os.environ.get("PORT", "8000"))
 MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "streamable-http")
 
-mcp = FastMCP(f"shopify_mcp_{SHOPIFY_STORE}", host="0.0.0.0", port=PORT, json_response=True)
+# ---------------------------------------------------------------------------
+# Access: the MCP endpoint lives behind a secret path
+#
+# This server has full Admin API access to the store, so nothing may be reachable
+# without a secret. claude.ai custom connectors cannot send a custom header, so the
+# secret lives in the URL:
+#
+#   https://<host>/mcp/<MCP_PATH_SECRET>          Streamable HTTP
+#   https://<host>/mcp/<MCP_PATH_SECRET>/sse      SSE (only when MCP_TRANSPORT=sse)
+#
+# Rules (same as the google-drive and reamaze MCP servers):
+# - Every other path, and every wrong secret, gets a plain 404. Never a 401, a
+#   WWW-Authenticate header or /.well-known/oauth-* documents: those make claude.ai
+#   start OAuth client registration and the connector breaks.
+# - No secret, or a weak one (under 32 URL-safe characters), means nothing is served.
+#   The server fails closed; it never falls back to an open /mcp.
+# - The secret is never logged.
+# ---------------------------------------------------------------------------
+
+MIN_SECRET_LENGTH = 32
+_PATH_SECRET = os.environ.get("MCP_PATH_SECRET", "").strip()
+SECRET_USABLE = bool(re.fullmatch(r"[A-Za-z0-9_-]{%d,}" % MIN_SECRET_LENGTH, _PATH_SECRET))
+
+if SECRET_USABLE:
+    MCP_HTTP_PATH = f"/mcp/{_PATH_SECRET}"
+else:
+    # Mount on a throwaway path nobody knows, so every request gets 404.
+    MCP_HTTP_PATH = f"/mcp/{secrets.token_urlsafe(48)}"
+    logger.error(
+        "MCP_PATH_SECRET is missing or weaker than %d URL-safe characters (A-Z a-z 0-9 _ -). "
+        "Every MCP route answers 404 until it is set in Railway -> Variables.",
+        MIN_SECRET_LENGTH,
+    )
+
+def _redact(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.replace(_PATH_SECRET, "<secret>")
+    if isinstance(value, tuple):
+        return tuple(_redact(v) for v in value)
+    if isinstance(value, dict):
+        return {k: _redact(v) for k, v in value.items()}
+    return value
+
+
+_base_record_factory = logging.getLogRecordFactory()
+
+
+def _redacting_record_factory(*args, **kwargs) -> logging.LogRecord:
+    # uvicorn logs every request line, path included. Strip the secret from every log
+    # record at creation, so no handler or log config set up later can leak it.
+    record = _base_record_factory(*args, **kwargs)
+    if SECRET_USABLE:
+        record.msg = _redact(record.msg)
+        if record.args:
+            record.args = _redact(record.args)
+    return record
+
+
+logging.setLogRecordFactory(_redacting_record_factory)
+
+mcp = FastMCP(
+    f"shopify_mcp_{SHOPIFY_STORE}",
+    host="0.0.0.0",
+    port=PORT,
+    json_response=True,
+    streamable_http_path=MCP_HTTP_PATH,
+    sse_path=f"{MCP_HTTP_PATH}/sse",
+    message_path=f"{MCP_HTTP_PATH}/messages/",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -3049,4 +3119,5 @@ async def shopify_get_product_category(params: GetProductCategoryInput) -> str:
 # Entrypoint
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    logger.info("MCP route: %s", "on (secret path)" if SECRET_USABLE else "OFF, MCP_PATH_SECRET not set")
     mcp.run(transport=MCP_TRANSPORT)
