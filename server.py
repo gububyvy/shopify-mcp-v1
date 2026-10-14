@@ -2127,7 +2127,7 @@ async def shopify_create_file(params: CreateFileInput) -> str:
         node = files[0]
         file_id = node.get("id")
 
-        query = "query fileNode($id: ID!) { node(id: $id) { %s } }" % _FILE_FIELDS
+        query = "query fileNode($id: ID!) { node(id: $id) { ... on File { %s } } }" % _FILE_FIELDS
         deadline = time.time() + params.wait_seconds
         while node.get("fileStatus") not in ("READY", "FAILED") and time.time() < deadline:
             await asyncio.sleep(2)
