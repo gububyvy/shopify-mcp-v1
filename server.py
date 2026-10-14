@@ -14,6 +14,7 @@ Token Management:
 import json
 import os
 import re
+import sys
 import secrets
 import logging
 import time
@@ -36,6 +37,31 @@ API_VERSION          = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
 
 # Refresh buffer: refresh token 30 minutes before expiry (only used with OAuth)
 TOKEN_REFRESH_BUFFER = int(os.environ.get("TOKEN_REFRESH_BUFFER", "1800"))
+
+_PATH_SECRET_EARLY = os.environ.get("MCP_PATH_SECRET", "").strip()
+
+
+class _RedactingStream:
+    """Wraps stdout/stderr so the path secret never reaches the log output, whatever
+    wrote it: log records with non-str args, tracebacks, print(), warnings."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def write(self, s):
+        if _PATH_SECRET_EARLY and isinstance(s, str):
+            s = s.replace(_PATH_SECRET_EARLY, "<secret>")
+        return self._inner.write(s)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+if re.fullmatch(r"[A-Za-z0-9_-]{32,}", _PATH_SECRET_EARLY):
+    sys.stdout = _RedactingStream(sys.stdout)
+    sys.stderr = _RedactingStream(sys.stderr)
+else:
+    _PATH_SECRET_EARLY = ""
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("shopify_mcp")
@@ -2137,12 +2163,14 @@ _FILE_FIELDS = """
   preview { image { url width height } }
   ... on MediaImage { image { url width height } }
   ... on GenericFile { url }
+  ... on Video { sources { url mimeType } }
 """
 
 
 def _file_summary(node: dict) -> dict:
     img = node.get("image") or (node.get("preview") or {}).get("image") or {}
-    url = img.get("url") or node.get("url") or ""
+    src = ((node.get("sources") or [{}])[0] or {}).get("url")
+    url = src or img.get("url") or node.get("url") or ""
     name = url.split("?")[0].rsplit("/", 1)[-1] if url else None
     out = {
         "id": node.get("id"),
@@ -2199,10 +2227,16 @@ async def shopify_create_file(params: CreateFileInput) -> str:
 
         query = "query fileNode($id: ID!) { node(id: $id) { ... on File { %s } } }" % _FILE_FIELDS
         deadline = time.time() + params.wait_seconds
-        while node.get("fileStatus") not in ("READY", "FAILED") and time.time() < deadline:
-            await asyncio.sleep(2)
-            d = await _graphql(query, variables={"id": file_id})
-            node = d.get("node") or node
+        try:
+            while node.get("fileStatus") not in ("READY", "FAILED") and time.time() < deadline:
+                await asyncio.sleep(2)
+                d = await _graphql(query, variables={"id": file_id})
+                node = d.get("node") or node
+        except Exception as e:
+            out = _file_summary(node)
+            out["warning"] = (f"File was created; status check failed ({e}). "
+                              "Check it with shopify_list_files, do not create it again.")
+            return _fmt(out)
         return _fmt(_file_summary(node))
     except Exception as e:
         return _error(e)
@@ -3120,4 +3154,9 @@ async def shopify_get_product_category(params: GetProductCategoryInput) -> str:
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     logger.info("MCP route: %s", "on (secret path)" if SECRET_USABLE else "OFF, MCP_PATH_SECRET not set")
-    mcp.run(transport=MCP_TRANSPORT)
+    import uvicorn
+    app = mcp.sse_app() if MCP_TRANSPORT == "sse" else mcp.streamable_http_app()
+    # No 307 to "/mcp/<secret>": behind Railway's proxy the Location would be http://,
+    # so a client following it would send the secret in clear text.
+    app.router.redirect_slashes = False
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")

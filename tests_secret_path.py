@@ -64,13 +64,13 @@ try:
     r = httpx.post(f"http://127.0.0.1:8761/mcp/{GEHEIM}", headers=h2, json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
     n = len(r.json()["result"]["tools"]) if r.status_code == 200 else 0
     check(f"juist geheim: tools/list geeft tools ({n})", n > 50)
-    for pad in ["/mcp", "/mcp/", f"/mcp/{GEHEIM[:-1]}", f"/mcp/{GEHEIM}x", f"/mcp/{GEHEIM.upper()}",
+    for pad in [f"/mcp/{GEHEIM}/", f"/mcp/{GEHEIM}%2F", "/mcp", "/mcp/", f"/mcp/{GEHEIM[:-1]}", f"/mcp/{GEHEIM}x", f"/mcp/{GEHEIM.upper()}",
                 "/MCP/" + GEHEIM, "/", "/sse", "/messages/", f"/mcp/{GEHEIM}/../", "/mcp/%2e%2e",
                 "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource", "/register",
                 "/authorize", "/token"]:
         r = post(8761, pad)
         check(f"POST {pad[:40]:40s} -> {r.status_code}, geen 401/WWW-Authenticate",
-              r.status_code in (404, 405, 307) and r.status_code != 401 and "www-authenticate" not in {k.lower() for k in r.headers})
+              r.status_code in (404, 405) and "location" not in {k.lower() for k in r.headers} and "www-authenticate" not in {k.lower() for k in r.headers})
         if r.status_code == 307:
             loc = r.headers.get("location", "")
             check(f"  redirect van {pad[:30]} lekt geen geheim", GEHEIM not in loc)
@@ -81,7 +81,7 @@ try:
     check("geheim staat niet in de serverlog", GEHEIM not in log)
     check("log meldt 'MCP route: on'", "MCP route: on" in log)
 finally:
-    p.kill()
+    p.kill(); p.wait()
 
 # 2. Geen geheim: alles dicht
 print("== stand 2: geen geheim")
@@ -93,7 +93,7 @@ try:
     log = open("server_8762.log", encoding="utf-8").read()
     check("log meldt OFF + fout over MCP_PATH_SECRET", "MCP route: OFF" in log and "MCP_PATH_SECRET is missing" in log)
 finally:
-    p.kill()
+    p.kill(); p.wait()
 
 # 3. Zwak geheim (te kort / verboden tekens): alles dicht
 for port, zwak in [(8763, "kort123"), (8764, "a" * 31), (8765, "spaties en /slash" + "x" * 32)]:
@@ -105,6 +105,6 @@ for port, zwak in [(8763, "kort123"), (8764, "a" * 31), (8765, "spaties en /slas
         r = post(port, "/mcp")
         check(f"/mcp blijft dicht -> {r.status_code}", "serverInfo" not in r.text)
     finally:
-        p.kill()
+        p.kill(); p.wait()
 
 print("\nRESULTAAT:", "ALLES OK" if not fouten else f"{len(fouten)} FOUT(EN): {fouten}")

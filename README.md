@@ -100,7 +100,7 @@ INFO  Token mode: static SHOPIFY_ACCESS_TOKEN (no auto-refresh)
 INFO  Uvicorn running on http://0.0.0.0:8000
 ```
 
-Your MCP server is running at `http://localhost:8000/mcp`.
+Your MCP server is running at `http://localhost:8000/mcp/<MCP_PATH_SECRET>`. Without `MCP_PATH_SECRET` (32+ URL-safe characters) every route answers 404: the server fails closed.
 
 ---
 
@@ -137,10 +137,10 @@ Railway restarts your server automatically after saving.
 
 ### Your MCP endpoint URL
 
-Combine your Railway URL with `/mcp`:
+Set `MCP_PATH_SECRET` in Railway -> Variables (`python -c "import secrets;print(secrets.token_urlsafe(32))"`), then combine your Railway URL with `/mcp/<secret>` (no trailing slash):
 
 ```
-https://your-app.up.railway.app/mcp
+https://your-app.up.railway.app/mcp/<MCP_PATH_SECRET>
 ```
 
 ### Add the server in Claude.ai
@@ -154,7 +154,7 @@ https://your-app.up.railway.app/mcp
 3. Click **Add integration**
 4. Fill in:
    - **Name:** `Shopify`
-   - **URL:** `https://your-app.up.railway.app/mcp`
+   - **URL:** `https://your-app.up.railway.app/mcp/<MCP_PATH_SECRET>` (keep it private: anyone with this URL has full Admin access)
 5. For the **authentication token** field: leave it blank for now (your server does not require auth by default)
 
 > If you want to secure your server with an authentication token (recommended for production), see the section below.
@@ -263,7 +263,7 @@ Check that `SHOPIFY_STORE` is set to just the store name — not the full URL.
 ✅ `my-store` &nbsp; ❌ `my-store.myshopify.com` &nbsp; ❌ `https://my-store.myshopify.com`
 
 **Claude can't connect to the server**
-Make sure your Railway deployment is active and a domain is generated. Test by opening `https://your-app.up.railway.app/mcp` in a browser — you should get a response, not a 404.
+Make sure your Railway deployment is active and a domain is generated. Every path except `/mcp/<MCP_PATH_SECRET>` answers 404 by design. Check the deploy log for `MCP route: on (secret path)`; `OFF` means the secret is missing or too short.
 
 **I lost my Shopify access token**
 Shopify only shows it once. Go to Shopify Admin → Settings → Apps → your app → API credentials → Uninstall app → Install app again → Reveal token once.
