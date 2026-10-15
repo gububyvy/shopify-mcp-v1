@@ -1687,6 +1687,50 @@ async def shopify_delete_collection(params: DeleteCollectionInput) -> str:
         return _error(e)
 
 
+class SetCollectionsPublishedInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    collection_ids: List[int] = Field(..., min_length=1, max_length=250, description="Numeric collection IDs")
+    published: bool = Field(..., description="false = take offline in the Online Store (reversible), true = publish again")
+
+
+@mcp.tool(
+    name="shopify_set_collections_published",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_set_collections_published(params: SetCollectionsPublishedInput) -> str:
+    """Publish or unpublish many collections on the Online Store channel in one call.
+
+    Unpublishing is the reversible alternative to deleting: the collection and its
+    rules stay in the admin, but /collections/<handle> returns 404 and it drops out
+    of the sitemap and search. Publish again with published=true. Runs one by one and
+    reports per collection.
+    """
+    try:
+        pub_id = await _get_online_store_publication_id()
+        if not pub_id:
+            return _fmt({"error": "Online Store publication not found"})
+        name = "publishablePublish" if params.published else "publishableUnpublish"
+        mutation = """
+        mutation %s($id: ID!, $input: [PublicationInput!]!) {
+          %s(id: $id, input: $input) { userErrors { field message } }
+        }
+        """ % (name, name)
+        results = []
+        for cid in params.collection_ids:
+            try:
+                data = await _graphql(mutation, variables={
+                    "id": f"gid://shopify/Collection/{cid}", "input": [{"publicationId": pub_id}]})
+                errors = (data.get(name) or {}).get("userErrors", [])
+                results.append({"collection_id": cid, "ok": not errors, "errors": errors or None})
+            except Exception as e:
+                results.append({"collection_id": cid, "ok": False, "errors": _error(e)})
+        ok = sum(1 for r in results if r["ok"])
+        return _fmt({"published": params.published, "total": len(results), "succeeded": ok,
+                     "failed": len(results) - ok, "results": [r for r in results if not r["ok"]] or "all ok"})
+    except Exception as e:
+        return _error(e)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # INVENTORY
 # ═══════════════════════════════════════════════════════════════════════════
