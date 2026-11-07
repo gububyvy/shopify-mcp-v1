@@ -2882,6 +2882,35 @@ async def shopify_delete_article(params: DeleteArticleInput) -> str:
         return _error(e)
 
 
+class DeleteBlogInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    blog_id: int = Field(..., description="Blog ID to delete (see shopify_list_blogs)")
+    allow_with_articles: bool = Field(
+        False,
+        description="Safety lock: by default the delete is refused if the blog still has articles "
+                    "(deleting a blog deletes all its articles). Set True only after explicit approval.",
+    )
+
+
+@mcp.tool(
+    name="shopify_delete_blog",
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_delete_blog(params: DeleteBlogInput) -> str:
+    """Delete a whole blog (e.g. an empty 'News' blog that still renders an empty /blogs/news page and sits in the sitemap).
+    Refuses when the blog still has articles unless allow_with_articles=True. WARNING: destructive and cannot be undone."""
+    try:
+        cnt = await _request("GET", f"blogs/{params.blog_id}/articles/count.json", params={"published_status": "any"})
+        n = int((cnt or {}).get("count", 0))
+        if n > 0 and not params.allow_with_articles:
+            return _fmt({"deleted": False, "blog_id": params.blog_id, "articles": n,
+                         "reason": "blog still has articles; pass allow_with_articles=true only after explicit approval"})
+        await _request("DELETE", f"blogs/{params.blog_id}.json")
+        return _fmt({"deleted": True, "blog_id": params.blog_id, "articles_deleted": n})
+    except Exception as e:
+        return _error(e)
+
+
 # ---------------------------------------------------------------------------
 # Policies  (REST read + GraphQL update — requires read/write_legal_policies)
 # ---------------------------------------------------------------------------
